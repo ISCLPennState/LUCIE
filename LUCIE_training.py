@@ -115,81 +115,129 @@ test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
 
 
 
-def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, loss_fn='l2'):
+def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, loss_fn='l2', reg_rate=0):
 
     train_start = time.time()
 
     train_loader_1 = DataLoader(train_set, batch_size=16, shuffle=True)
     test_loader_1 = DataLoader(test_set, batch_size=16, shuffle=True)
 
+    infer_bias = 1e+20
+    recall_count = 0
     for epoch in range(nepochs):
+        print(epoch)
+        for param_group in optimizer.param_groups:
+            print(param_group['lr'])
+        if epoch < 149:
+            if scheduler is not None:
+                scheduler.step()
+        else:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 1e-6
+        if recall_count > 10:
+            print(epoch)
+            break
         epoch_start = time.time()
 
         optimizer.zero_grad()
         acc_loss = 0
 
         model.train()
-        i = 0
+        batch_num = 0
         for inp, tar in train_loader_1:
-            i += 1
+            #noise = (torch.randn(inp.size(0), 5, inp.size(2), inp.size(3)) * std + mean).to(device)
+            batch_num += 1
             loss = 0
             inp = inp.to(device)
-            tar = tar[:,:4,:,:].to(device)
+            #inp[:,:5,:,:] += noise
+            tar = tar.to(device)
+            #tar[:,:5,:,:] -= noise
             prd = model(inp)
 
             if loss_fn == 'l2':
-                loss = l2loss_sphere(prd, tar)
-            #    loss += 0.1*l2loss_sphere(frame, next_frame)
+                loss_delta = l2loss_sphere(prd[:,:5,:,:], tar[:,:5,:,:], relative=True)
+                loss_tp = torch.mean((prd[:,5:,:,:]-tar[:,5:,:,:])**2)
+                loss = (loss_delta.to(device)*5 + loss_tp.to(device))/6
+
             elif loss_fn == "spectral l2":
-                #loss = spectral_l2loss_sphere(prd, tar)
-                # prd = prd / res_array
-                # tar = tar / res_array
-                loss = SpectralLoss(img_size=(48, 96), absolute=True)(prd.cpu(),tar.cpu())
+
+                loss = SpectralLoss(img_size=(48, 96), absolute=True)(prd.to("cpu"),tar.to("cpu"))
+
+
             prd = prd.to(device)
             roll_loss = 0
             acc_loss += loss.item() * inp.size(0)
-            
+            # optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             prd_plt = prd
             tar_plt = tar
 
 
+        if (epoch+1) % 5 == 0:
+            model.eval()
+            with torch.no_grad():
+                pred_frame = input_dataset[0].reshape(1,7,48,96) # T, SH, U, V, SP, TISR, ORO
+                pred_frame = pred_frame.to(device)
+                temp_bias = torch.zeros(48,96).to(device)
+                for k in range(7500):
+                    previous_frame = pred_frame[:,:5,:,:]
+                    pred_frame = model(pred_frame) # 6
+                    temp_bias += pred_frame[0,0,:,:].clone().detach()
+                    pred_frame[:,:5,:,:] = pred_frame[:,:5,:,:] * target_stds[:,:5,:,:] # T, SH, U, V, SP, TP
+                    # pred_frame = (pred_frame + 1) / 2 * (target_maxs - target_mins) + target_mins
 
-        if scheduler is not None:
-            scheduler.step()
-        acc_loss = acc_loss / len(train_loader_1.dataset)
-        if epoch % 5 == 0:
-            print(str(epoch))
-            plt.subplot(1,2,1)
-            plt.imshow(prd_plt[0,0,:,:].clone().detach().cpu(),origin="lower")
-            plt.colorbar(shrink=0.5)
-            plt.subplot(1,2,2)
-            plt.imshow(tar_plt[0,0,:,:].clone().detach().cpu(),origin="lower")
-            plt.colorbar(shrink=0.5)
-            #plt.savefig("train_inc.png")
-            plt.show()
-        valid_loss = 0
-        model.eval()
-        with torch.no_grad():
-            for inp, tar in test_loader_1:
-                inp = inp.to(device)
-                tar = tar[:,:4,:,:].to(device)
-                prd = model(inp)
-                if loss_fn == 'l2':
-                    loss = l2loss_sphere(prd, tar, relative=True)
-                elif loss_fn == "spectral l2":
-                    # prd = prd / res_array
-                    # tar = tar / res_array
-                    loss = spectral_l2loss_sphere(prd, tar, relative=True)
-                    #loss = SpectralLoss(img_size=(48, 96),p=5.0)(prd.cpu(),tar.cpu())
-                prd = prd.to(device)
+                    pred_frame[:,:5,:,:] += previous_frame[:,:5,:,:] * input_stds + input_means
+                    tp_frame = pred_frame[:,5:,:,:] * tp_std + tp_mean
+                    # pred_frame += (previous_frame + 1) / 2 * (input_maxs - input_mins) + input_mins
+                    plot_frame = torch.cat((pred_frame[:,:5,:,:], tp_frame), 1) # T, SH, U, V, SP, TP
 
-                valid_loss += loss.item() * inp.size(0)
-                prd_testplt = prd
-                tar_testplt = tar
-        valid_loss = valid_loss / len(test_loader_1.dataset)
-        epoch_time = time.time() - epoch_start
+                    pred_frame = pred_frame[:,:5,:,:]
+                    pred_frame = (pred_frame - input_means) / input_stds
+                    # pred_frame = 2 * (pred_frame - input_mins) / (input_maxs - input_mins) - 1
+
+                    pred_frame = torch.cat((pred_frame, input_dataset[k+1,5:,:,:].reshape(1,2,48,96).to(device)), dim=1)
+                    
+                temp_bias = torch.mean(torch.abs(temp_bias / 7500 - true_temp_clim))
+                print(temp_bias)
+                if epoch > 100:
+                    if temp_bias <= infer_bias:
+                        infer_bias = temp_bias
+                        torch.save(model.state_dict(), 'LUCIE_method_results/LUCIE_training_checkpoint.pth')
+                        recall_count = 0
+                    else:
+                        state_pth = torch.load('LUCIE_method_results/LUCIE_training_checkpoint.pth')
+                        model.load_state_dict(state_pth)
+                        recall_count += 1
+                        
+                    
+                plot_frame = plot_frame.clone().detach().cpu().numpy()
+                fig = plt.figure(figsize=(14, 4))
+                plt.subplot(1,7,1)
+                plt.imshow(plot_frame[0][0], origin="lower")
+                plt.axis("off")
+                plt.colorbar(shrink=0.3)
+                plt.subplot(1,7,2)
+                plt.imshow(plot_frame[0][1], origin="lower")
+                plt.axis("off")
+                plt.colorbar(shrink=0.3)
+                plt.subplot(1,7,3)
+                plt.imshow(plot_frame[0][2], origin="lower")
+                plt.axis("off")
+                plt.colorbar(shrink=0.3)
+                plt.subplot(1,7,4)
+                plt.imshow(plot_frame[0][3], origin="lower")
+                plt.axis("off")
+                plt.colorbar(shrink=0.3)
+                plt.subplot(1,7,5)
+                plt.imshow(plot_frame[0][4], origin="lower")
+                plt.axis("off")
+                plt.colorbar(shrink=0.3)
+                plt.subplot(1,7,6)
+                plt.imshow(plot_frame[0][5], origin="lower")
+                plt.axis("off")
+                plt.colorbar(shrink=0.3)
+                plt.show()
 
 
 
