@@ -48,21 +48,6 @@ from torch_harmonics.distributed import polar_group_rank, azimuth_group_rank
 from torch_harmonics.distributed import compute_split_shapes, split_tensor_along_dim
 
 
-
-# Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
 from dataclasses import dataclass
 
 
@@ -97,150 +82,38 @@ def load_data(fname):
 
     return np_data
 
-#data = load_data("../speedy_numpy_file.npz")
-data = load_data('era5_numpy_file.npz')
 
-data_sr = np.load("era5_tisr.npz")
-tisr = data_sr["tisr"]
-tisr = (tisr - np.mean(tisr))/np.std(tisr)
-
-# data_sst = np.load("era5_sst.npz")
-# sst_true = data_sst["sst"]
-# sst_true[np.isnan(sst_true)] = 270
-# sst = (sst_true - np.mean(sst_true))/np.std(sst_true)
-
-std_array = []
-temp = data[...,0]
-temp_mean = np.mean(temp)
-temp_std = np.std(temp)
-temp = (temp - np.mean(temp))/np.std(temp)
-#temp = 2*(temp - np.min(temp)) / (np.max(temp) - np.min(temp))-1
-
-humid = data[...,1]
-humid_mean = np.mean(humid)
-humid_std = np.std(humid)
-humid = (humid - np.mean(humid))/np.std(humid)
-#humid = 2*(humid - np.min(humid)) / (np.max(humid) - np.min(humid))-1
-
-u_wind = data[...,2]
-u_wind_mean = np.mean(u_wind)
-u_wind_std = np.std(u_wind)
-u_wind = (u_wind - np.mean(u_wind))/np.std(u_wind)
-#u_wind = 2*(u_wind - np.min(u_wind)) / (np.max(u_wind) - np.min(u_wind))-1
-
-v_wind = data[...,3]
-v_wind_mean = np.mean(v_wind)
-v_wind_std = np.std(v_wind)
-v_wind = (v_wind - np.mean(v_wind))/np.std(v_wind)
-
-#stacked_data = np.stack((temp, humid, u_wind, v_wind), axis=-1)
-#stacked_data = (stacked_data - np.mean(stacked_data))/np.std(stacked_data)
-
-# temp = stacked_data[...,0]
-# humid = stacked_data[...,1]
-# u_wind = stacked_data[...,2]
-# v_wind = stacked_data[...,3]
-
-std_array.append(std_zeromean(temp[1:]-temp[:-1]))
-std_array.append(std_zeromean(humid[1:]-humid[:-1]))
-std_array.append(std_zeromean(u_wind[1:]-u_wind[:-1]))
-std_array.append(std_zeromean(v_wind[1:]-v_wind[:-1]))
-# std_array.append(std_zeromean(tisr[1:]-tisr[:-1]))
-# std_array.append(std_zeromean(sst[1:]-sst[:-1]))
-std_array = np.array(std_array)
-
-_, temp_res = residual_norm(temp, std_array)
-_, humid_res = residual_norm(humid, std_array)
-_, u_res = residual_norm(u_wind, std_array)
-_, v_res = residual_norm(v_wind, std_array)
-# _, tisr_res = residual_norm(tisr, std_array)
-#sst, sst_res = residual_norm(sst, std_array)
-
-res_array = np.stack((temp_res, humid_res, u_res, v_res), axis=0).reshape(1,4,1,1)
-res_array = torch.tensor(res_array).to(device)
-
-stacked_data = np.stack((temp, humid, u_wind, v_wind, tisr), axis=-1)
-#stacked_res = np.stack((temp_res, humid_res, u_res, v_res), axis=-1)
-
-
-#stacked_data = np.stack((temp,humid), axis=-1)
+data_dict = torch.load('LUCIE_training_data.pth')
+input_dataset = data_dict['input_dataset']
+target_dataset = data_dict['target_dataset']
+input_means = data_dict['input_means']
+input_stds = data_dict['input_stds']
+input_mins = data_dict['input_mins']
+input_maxs = data_dict['input_maxs']
+target_means = data_dict['target_means']
+target_stds = data_dict['target_stds']
+target_mins = data_dict['target_mins']
+target_maxs = data_dict['target_maxs']
 
 
 ntrain = 14000
 ntest = 2000
 
-
-dataset = stacked_data
-dataset = torch.tensor(dataset)
-
+train_a = input_dataset[:ntrain,:,:,:]
+train_u = target_dataset[:ntrain,:,:,:]
 
 
-train_a = dataset[:ntrain,:,:,:]
-train_u = dataset[1:ntrain+1,:,:,:]
-train_a = train_a.permute(0,3,1,2)
-train_u = train_u.permute(0,3,1,2)
+test_a = input_dataset[ntrain:ntrain+ntest,:,:,:]
+test_u = target_dataset[ntrain:ntrain+ntest,:,:,:]
 
-
-test_a = dataset[ntrain:ntrain+ntest,:,:,:]
-test_u = dataset[ntrain+1:ntrain+ntest+1,:,:,:]
-test_a = test_a.permute(0,3,1,2)
-test_u = test_u.permute(0,3,1,2)
-dataset = dataset.permute(0,3,1,2)
 
 train_set = TensorDataset(train_a, train_u)
 train_loader = DataLoader(train_set, batch_size=1, shuffle=False)
-
 
 test_set = TensorDataset(test_a, test_u)
 test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
 
 
-
-def integrate_grid(ugrid, dimensionless=False, polar_opt=0):
-
-    dlon = 2 * torch.pi / nlon
-    radius = 1 if dimensionless else radius
-    if polar_opt > 0:
-        out = torch.sum(ugrid[..., polar_opt:-polar_opt, :] * quad_weights[polar_opt:-polar_opt] * dlon * radius**2, dim=(-2, -1))
-    else:
-        out = torch.sum(ugrid * quad_weights * dlon * radius**2, dim=(-2, -1))
-    return out
-
-def l2loss_sphere(prd, tar, relative=False, squared=True):
-    loss = integrate_grid((prd - tar)**2, dimensionless=True).sum(dim=-1)
-    if relative:
-        loss = loss / integrate_grid(tar**2, dimensionless=True).sum(dim=-1)
-
-    if not squared:
-        loss = torch.sqrt(loss)
-    loss = loss.mean()
-
-    return loss
-
-def spectral_l2loss_sphere(prd, tar, relative=False, squared=True):
-    # compute coefficients
-    prd = prd.cpu()
-    tar = tar.cpu()
-    diff = (prd-tar)
-
-    shtdiff = sht(diff)
-    coeffs = torch.view_as_real(shtdiff)
-    coeffs = coeffs[..., 0]**2 + coeffs[..., 1]**2
-    norm2 = coeffs[..., :, 0] + 2 * torch.sum(coeffs[..., :, 1:], dim=-1)
-    loss = torch.sum(norm2, dim=(-1,-2))
-
-    if relative:
-        tar_coeffs = torch.view_as_real(sht(tar))
-        tar_coeffs = tar_coeffs[..., 0]**2 + tar_coeffs[..., 1]**2
-        tar_norm2 = tar_coeffs[..., :, 0] + 2 * torch.sum(tar_coeffs[..., :, 1:], dim=-1)
-        tar_norm2 = torch.sum(tar_norm2, dim=(-1,-2))
-        loss = loss / tar_norm2
-
-    if not squared:
-        loss = torch.sqrt(loss)
-    loss = loss.mean()
-
-    return loss
 
 def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, loss_fn='l2'):
 
@@ -275,6 +148,7 @@ def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=2
             prd = prd.to(device)
             roll_loss = 0
             acc_loss += loss.item() * inp.size(0)
+            
             loss.backward()
             optimizer.step()
             prd_plt = prd
@@ -321,33 +195,35 @@ def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=2
 
 
 
-
 torch.manual_seed(1447)
 torch.cuda.manual_seed(1447)
 torch.cuda.empty_cache()
 
+std = 0.05
+mean = 0
+
 grid='legendre-gauss'
 nlat = 48
 nlon = 96
-hard_thresholding_fraction = 1
+hard_thresholding_fraction = 0.9
 lmax = ceil(nlat / 1)
 mmax = lmax
 modes_lat = int(nlat * hard_thresholding_fraction)
 modes_lon = int(nlon//2 * hard_thresholding_fraction)
 modes_lat = modes_lon = min(modes_lat, modes_lon)
-sht = DistributedRealSHT(nlat, nlon, lmax=modes_lat, mmax=modes_lon, grid=grid, csphase=False)
+sht = RealSHT(nlat, nlon, lmax=modes_lat, mmax=modes_lon, grid=grid, csphase=False)
 radius=6.37122E6
 cost, quad_weights = th.quadrature.legendre_gauss_weights(nlat, -1, 1)
 #cost, quad_weights = th.quadrature.clenshaw_curtiss_weights(nlat, -1, 1)
 quad_weights = (torch.as_tensor(quad_weights).reshape(-1, 1)).to(device)
 
 model = SphericalFourierNeuralOperatorNet(params = {}, spectral_transform='sht', filter_type = "linear", operator_type='dhconv', img_shape=(48, 96),
-                 num_layers=6, in_chans=5, out_chans=4, scale_factor=1, embed_dim=32, activation_function="gelu", big_skip=True, pos_embed="latlon", use_mlp=True,
+                 num_layers=7, in_chans=7, out_chans=6, scale_factor=1, embed_dim=48, activation_function="silu", big_skip=True, pos_embed="latlon", use_mlp=True,
                                           normalization_layer="instance_norm", hard_thresholding_fraction=hard_thresholding_fraction,
                                           mlp_ratio = 2.).to(device)
 
 from torch.optim.lr_scheduler import OneCycleLR, CosineAnnealingLR, StepLR
-optimizer = torch.optim.Adam(model.parameters(), lr=1E-4, weight_decay=0)
-scheduler = CosineAnnealingLR(optimizer, T_max=100, eta_min=5e-6)
-train_model(model, train_set, test_set, optimizer, scheduler=scheduler, nepochs=100, loss_fn = "spectral l2")
-torch.save(model.state_dict(), 'ACE_era5_tisr_lg_specl2.pth')
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
+scheduler = CosineAnnealingLR(optimizer, T_max=150, eta_min=1e-5)
+train_model(model, train_set, test_set, optimizer, scheduler=scheduler, nepochs=150, loss_fn = "l2")
+# torch.save(model.state_dict(), 'LUCIE.pth')

@@ -83,95 +83,35 @@ def load_data(fname):
 
     return np_data
 
-#data = load_data("../speedy_numpy_file.npz")
-data = load_data('era5_numpy_file.npz')
-
-data_sr = np.load("era5_tisr.npz")
-tisr = data_sr["tisr"]
-tisr = (tisr - np.mean(tisr))/np.std(tisr)
-
-# data_sst = np.load("era5_sst.npz")
-# sst_true = data_sst["sst"]
-# sst_true[np.isnan(sst_true)] = 270
-# sst = (sst_true - np.mean(sst_true))/np.std(sst_true)
-
-std_array = []
-temp = data[...,0]
-temp_mean = np.mean(temp)
-temp_std = np.std(temp)
-temp = (temp - np.mean(temp))/np.std(temp)
-#temp = 2*(temp - np.min(temp)) / (np.max(temp) - np.min(temp))-1
-
-humid = data[...,1]
-humid_mean = np.mean(humid)
-humid_std = np.std(humid)
-humid = (humid - np.mean(humid))/np.std(humid)
-#humid = 2*(humid - np.min(humid)) / (np.max(humid) - np.min(humid))-1
-
-u_wind = data[...,2]
-u_wind_mean = np.mean(u_wind)
-u_wind_std = np.std(u_wind)
-u_wind = (u_wind - np.mean(u_wind))/np.std(u_wind)
-#u_wind = 2*(u_wind - np.min(u_wind)) / (np.max(u_wind) - np.min(u_wind))-1
-
-v_wind = data[...,3]
-v_wind_mean = np.mean(v_wind)
-v_wind_std = np.std(v_wind)
-v_wind = (v_wind - np.mean(v_wind))/np.std(v_wind)
-
-#stacked_data = np.stack((temp, humid, u_wind, v_wind), axis=-1)
-#stacked_data = (stacked_data - np.mean(stacked_data))/np.std(stacked_data)
-
-# temp = stacked_data[...,0]
-# humid = stacked_data[...,1]
-# u_wind = stacked_data[...,2]
-# v_wind = stacked_data[...,3]
-
-std_array.append(std_zeromean(temp[1:]-temp[:-1]))
-std_array.append(std_zeromean(humid[1:]-humid[:-1]))
-std_array.append(std_zeromean(u_wind[1:]-u_wind[:-1]))
-std_array.append(std_zeromean(v_wind[1:]-v_wind[:-1]))
-# std_array.append(std_zeromean(tisr[1:]-tisr[:-1]))
-# std_array.append(std_zeromean(sst[1:]-sst[:-1]))
-std_array = np.array(std_array)
-
-_, temp_res = residual_norm(temp, std_array)
-_, humid_res = residual_norm(humid, std_array)
-_, u_res = residual_norm(u_wind, std_array)
-_, v_res = residual_norm(v_wind, std_array)
-# _, tisr_res = residual_norm(tisr, std_array)
-#sst, sst_res = residual_norm(sst, std_array)
-
-res_array = np.stack((temp_res, humid_res, u_res, v_res), axis=0).reshape(1,4,1,1)
-res_array = torch.tensor(res_array).to(device)
-
-stacked_data = np.stack((temp, humid, u_wind, v_wind, tisr), axis=-1)
-#stacked_res = np.stack((temp_res, humid_res, u_res, v_res), axis=-1)
-
-
-#stacked_data = np.stack((temp,humid), axis=-1)
+data_dict = torch.load('LUCIE_training_data.pth')
+input_dataset = data_dict['input_dataset']
+target_dataset = data_dict['target_dataset']
+input_means = data_dict['input_means']
+input_stds = data_dict['input_stds']
+input_mins = data_dict['input_mins']
+input_maxs = data_dict['input_maxs']
+target_means = data_dict['target_means']
+target_stds = data_dict['target_stds']
+target_mins = data_dict['target_mins']
+target_maxs = data_dict['target_maxs']
 
 
 ntrain = 14000
 ntest = 2000
 
-
-dataset = stacked_data
-dataset = torch.tensor(dataset)
-
+train_a = input_dataset[:ntrain,:,:,:]
+train_u = target_dataset[:ntrain,:,:,:]
 
 
-train_a = dataset[:ntrain,:,:,:]
-train_u = dataset[1:ntrain+1,:,:,:]
-train_a = train_a.permute(0,3,1,2)
-train_u = train_u.permute(0,3,1,2)
+test_a = input_dataset[ntrain:ntrain+ntest,:,:,:]
+test_u = target_dataset[ntrain:ntrain+ntest,:,:,:]
 
 
-test_a = dataset[ntrain:ntrain+ntest,:,:,:]
-test_u = dataset[ntrain+1:ntrain+ntest+1,:,:,:]
-test_a = test_a.permute(0,3,1,2)
-test_u = test_u.permute(0,3,1,2)
-dataset = dataset.permute(0,3,1,2)
+train_set = TensorDataset(train_a, train_u)
+train_loader = DataLoader(train_set, batch_size=1, shuffle=False)
+
+test_set = TensorDataset(test_a, test_u)
+test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
 
 
 
@@ -195,28 +135,40 @@ cost, quad_weights = th.quadrature.legendre_gauss_weights(nlat, -1, 1)
 quad_weights = (torch.as_tensor(quad_weights).reshape(-1, 1)).to(device)
 
 model = SphericalFourierNeuralOperatorNet(params = {}, spectral_transform='sht', filter_type = "linear", operator_type='dhconv', img_shape=(48, 96),
-                 num_layers=6, in_chans=5, out_chans=4, scale_factor=1, embed_dim=32, activation_function="gelu", big_skip=True, pos_embed="latlon", use_mlp=True,
+                 num_layers=7, in_chans=7, out_chans=6, scale_factor=1, embed_dim=48, activation_function="silu", big_skip=True, pos_embed="latlon", use_mlp=True,
                                           normalization_layer="instance_norm", hard_thresholding_fraction=hard_thresholding_fraction,
                                           mlp_ratio = 2.).to(device)
 
-state_pth = torch.load("ACE_era5_tisr_lg_specl2_zscore_0.9_sp.pth")
+state_pth = torch.load("LUCIE.pth")
 model.load_state_dict(state_pth)
 
+from tqdm import tqdm
+val_a = input_dataset[0,:,:,:]
+
 save_data = []
-model.to(device)
 model.eval()
 with torch.no_grad():
-    inp_val = dataset[0].reshape(1,6,48,96).to(device)
+    inp_val = val_a.reshape(1,7,48,96)
+    inp_val = inp_val.to(device)
     for i in tqdm(range(7500)):
-        pred = model(inp_val)
-        #inp_val += data_denorm(pred.clone().detach(), val_mean, val_std)
-        #inp_val = inp_val + pred
-        inp_val = torch.cat((pred, dataset[i+1,5:,:,:].reshape(1,1,48,96).to(device)), dim=1)
+        previous = inp_val[:,:5,:,:]
 
-        pred = pred.cpu().clone().detach().permute(0,2,3,1).numpy()
-        save_data.append(pred[0])
+        pred = model(inp_val)
+        pred[:,:5,:,:] = pred[:,:5,:,:] * target_stds[:,:5,:,:]
+
+        pred[:,:5,:,:] += previous[:,:5,:,:] * input_stds + input_means
+        tp_frame = pred[:,5:,:,:] * tp_std + tp_mean
+        # pred_frame += (previous_frame + 1) / 2 * (input_maxs - input_mins) + input_mins
+        plot = torch.cat((pred[:,:5,:,:],tp_frame), 1)
+
+        inp_val = (pred[:,:5,:,:] - input_means) / input_stds
+        inp_val = torch.cat((inp_val, input_dataset[i+1,5:,:,:].reshape(1,2,48,96).to(device)), dim=1)
+        plot = plot.cpu().clone().detach().permute(0,2,3,1).numpy()
+        save_data.append(plot[0])
 
 save_data = np.array(save_data)
-np.savez('ACE_era5_tisr_5years.npz', single_array=save_data)
+save_data[:,:,:,5] = (np.exp(save_data[:,:,:,5]) - 1) * 1e-2
+
+np.savez('LUCIE.npz', single_array=save_data)
 
 

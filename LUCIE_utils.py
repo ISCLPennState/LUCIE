@@ -1,42 +1,12 @@
-from functools import partial
-import torch
-import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
-from dataclasses import dataclass
-from typing import Any, Tuple
-import torch_harmonics as th
-import torch_harmonics.distributed as thd
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
-from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-
-
-from torch_harmonics import *
+# torch packages
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
+from torch.cuda import amp
+from torch.nn.parallel import DistributedDataParallel
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.utils.checkpoint import checkpoint
-from torch.cuda import amp
-import math
-import warnings
-
-from torch.cuda import amp
-
-# import FactorizedTensor from tensorly for tensorized operations
-import tensorly as tl
-
-tl.set_backend("pytorch")
-# from tensorly.plugins import use_opt_einsum
-# use_opt_einsum('optimal')
-from tltorch.factorized_tensors.core import FactorizedTensor
-
-import os
-import logging
-import datetime as dt
-from typing import Union
-import numpy as np
-from typing import Tuple
 
 from torch_harmonics.quadrature import legendre_gauss_weights, lobatto_weights, clenshaw_curtiss_weights
 from torch_harmonics.legendre import _precompute_legpoly, _precompute_dlegpoly
@@ -44,23 +14,28 @@ from torch_harmonics.distributed import polar_group_size, azimuth_group_size, di
 from torch_harmonics.distributed import polar_group_rank, azimuth_group_rank
 from torch_harmonics.distributed import compute_split_shapes, split_tensor_along_dim
 
+# numpy packages
+import numpy as np
 
+# import torch_harmonics
+from torch_harmonics import *
+import torch_harmonics as th
+import torch_harmonics.distributed as thd
+import torch.distributed as dist
 
-# Copyright (c) 2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
+# misc
+from functools import partial
 from dataclasses import dataclass
+from typing import Any, Tuple
+import math
+import warnings
+import os
+import logging
+import datetime as dt
+from typing import Union
+from typing import Tuple
+from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass
@@ -93,11 +68,6 @@ class ModelMetaData:
         self.onnx_cpu = self.onnx if self.onnx_cpu is None else self.onnx_cpu
         self.onnx_gpu = self.onnx if self.onnx_gpu is None else self.onnx_gpu
 
-import torch
-import logging
-
-from typing import Union
-from pathlib import Path
 
 
 class Module(torch.nn.Module):
@@ -212,33 +182,6 @@ class Module(torch.nn.Module):
             count += param.numel()
         return count
 
-
-@torch.jit.script
-def compl_mul1d_fwd(
-    a: torch.Tensor, b: torch.Tensor
-) -> torch.Tensor:  # pragma: no cover
-    """
-    Performs a complex-valued multiplication operation between two 1-dimensional
-    tensors.
-    """
-    ac = torch.view_as_complex(a)
-    bc = torch.view_as_complex(b)
-    resc = torch.einsum("bix,io->box", ac, bc)
-    res = torch.view_as_real(resc)
-    return res
-
-
-@torch.jit.script
-def compl_muladd1d_fwd(
-    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
-) -> torch.Tensor:  # pragma: no cover
-    """
-    Performs complex multiplication of two 1-dimensional tensors 'a' and 'b', and then
-    adds a third tensor 'c'.
-    """
-    tmpcc = torch.view_as_complex(compl_mul1d_fwd(a, b))
-    cc = torch.view_as_complex(c)
-    return torch.view_as_real(tmpcc + cc)
 
 
 @torch.jit.script
@@ -418,176 +361,7 @@ def _contract_sep_dhconv(
     res = torch.view_as_real(resc)
     return res
 
-
-import torch
-
-import tensorly as tl
-
-tl.set_backend("pytorch")
-# from tensorly.plugins import use_opt_einsum
-# use_opt_einsum('optimal')
-
-from tltorch.factorized_tensors.core import FactorizedTensor
-
 einsum_symbols = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-
-def _contract_dense(
-    x, weight, separable=False, operator_type="diagonal"
-):  # pragma: no cover
-    order = tl.ndim(x)
-    # batch-size, in_channels, x, y...
-    x_syms = list(einsum_symbols[:order])
-
-    # in_channels, out_channels, x, y...
-    weight_syms = list(x_syms[1:])  # no batch-size
-
-    # batch-size, out_channels, x, y...
-    if separable:
-        out_syms = [x_syms[0]] + list(weight_syms)
-    else:
-        weight_syms.insert(1, einsum_symbols[order])  # outputs
-        out_syms = list(weight_syms)
-        out_syms[0] = x_syms[0]
-
-    if operator_type == "diagonal":
-        pass
-    elif operator_type == "block-diagonal":
-        weight_syms.insert(-1, einsum_symbols[order + 1])
-        out_syms[-1] = weight_syms[-2]
-    elif operator_type == "dhconv":
-        weight_syms.pop()
-    else:
-        raise ValueError(f"Unkonw operator type {operator_type}")
-
-    eq = "".join(x_syms) + "," + "".join(weight_syms) + "->" + "".join(out_syms)
-
-    if not torch.is_tensor(weight):
-        weight = weight.to_tensor()
-
-    return tl.einsum(eq, x, weight)
-
-
-def _contract_cp(
-    x, cp_weight, separable=False, operator_type="diagonal"
-):  # pragma: no cover
-    order = tl.ndim(x)
-
-    x_syms = str(einsum_symbols[:order])
-    rank_sym = einsum_symbols[order]
-    out_sym = einsum_symbols[order + 1]
-    out_syms = list(x_syms)
-
-    if separable:
-        factor_syms = [einsum_symbols[1] + rank_sym]  # in only
-    else:
-        out_syms[1] = out_sym
-        factor_syms = [einsum_symbols[1] + rank_sym, out_sym + rank_sym]  # in, out
-
-    factor_syms += [xs + rank_sym for xs in x_syms[2:]]  # x, y, ...
-
-    if operator_type == "diagonal":
-        pass
-    elif operator_type == "block-diagonal":
-        out_syms[-1] = einsum_symbols[order + 2]
-        factor_syms += [out_syms[-1] + rank_sym]
-    elif operator_type == "dhconv":
-        factor_syms.pop()
-    else:
-        raise ValueError(f"Unkonw operator type {operator_type}")
-
-    eq = (
-        x_syms + "," + rank_sym + "," + ",".join(factor_syms) + "->" + "".join(out_syms)
-    )
-
-    return tl.einsum(eq, x, cp_weight.weights, *cp_weight.factors)
-
-
-def _contract_tucker(
-    x, tucker_weight, separable=False, operator_type="diagonal"
-):  # pragma: no cover
-    order = tl.ndim(x)
-
-    x_syms = str(einsum_symbols[:order])
-    out_sym = einsum_symbols[order]
-    out_syms = list(x_syms)
-    if separable:
-        core_syms = einsum_symbols[order + 1 : 2 * order]
-        # factor_syms = [einsum_symbols[1]+core_syms[0]] #in only
-        factor_syms = [xs + rs for (xs, rs) in zip(x_syms[1:], core_syms)]  # x, y, ...
-
-    else:
-        core_syms = einsum_symbols[order + 1 : 2 * order + 1]
-        out_syms[1] = out_sym
-        factor_syms = [
-            einsum_symbols[1] + core_syms[0],
-            out_sym + core_syms[1],
-        ]  # out, in
-        factor_syms += [
-            xs + rs for (xs, rs) in zip(x_syms[2:], core_syms[2:])
-        ]  # x, y, ...
-
-    if operator_type == "diagonal":
-        pass
-    elif operator_type == "block-diagonal":
-        raise NotImplementedError(
-            f"Operator type {operator_type} not implemented for Tucker"
-        )
-    else:
-        raise ValueError(f"Unkonw operator type {operator_type}")
-
-    eq = (
-        x_syms
-        + ","
-        + core_syms
-        + ","
-        + ",".join(factor_syms)
-        + "->"
-        + "".join(out_syms)
-    )
-
-    return tl.einsum(eq, x, tucker_weight.core, *tucker_weight.factors)
-
-
-def _contract_tt(
-    x, tt_weight, separable=False, operator_type="diagonal"
-):  # pragma: no cover
-    order = tl.ndim(x)
-
-    x_syms = list(einsum_symbols[:order])
-    weight_syms = list(x_syms[1:])  # no batch-size
-
-    if not separable:
-        weight_syms.insert(1, einsum_symbols[order])  # outputs
-        out_syms = list(weight_syms)
-        out_syms[0] = x_syms[0]
-    else:
-        out_syms = list(x_syms)
-
-    if operator_type == "diagonal":
-        pass
-    elif operator_type == "block-diagonal":
-        weight_syms.insert(-1, einsum_symbols[order + 1])
-        out_syms[-1] = weight_syms[-2]
-    elif operator_type == "dhconv":
-        weight_syms.pop()
-    else:
-        raise ValueError(f"Unkonw operator type {operator_type}")
-
-    rank_syms = list(einsum_symbols[order + 2 :])
-    tt_syms = []
-    for i, s in enumerate(weight_syms):
-        tt_syms.append([rank_syms[i], s, rank_syms[i + 1]])
-    eq = (
-        "".join(x_syms)
-        + ","
-        + ",".join("".join(f) for f in tt_syms)
-        + "->"
-        + "".join(out_syms)
-    )
-
-    return tl.einsum(eq, x, *tt_weight.factors)
-
 
 # jitted PyTorch contractions:
 def _contract_dense_pytorch(
@@ -597,20 +371,12 @@ def _contract_dense_pytorch(
     # to cheat the fused optimizers convert to real here
     x = torch.view_as_real(x)
 
-    if separable:
-        if operator_type == "diagonal":
-            x = _contract_sep_diagonal(x, weight)
-        elif operator_type == "dhconv":
-            x = _contract_sep_dhconv(x, weight)
-        else:
-            raise ValueError(f"Unkonw operator type {operator_type}")
+    if operator_type == "diagonal":
+        x = _contract_diagonal(x, weight)
+    elif operator_type == "dhconv":
+        x = _contract_dhconv(x, weight)
     else:
-        if operator_type == "diagonal":
-            x = _contract_diagonal(x, weight)
-        elif operator_type == "dhconv":
-            x = _contract_dhconv(x, weight)
-        else:
-            raise ValueError(f"Unkonw operator type {operator_type}")
+        raise ValueError(f"Unkonw operator type {operator_type}")
 
     # to cheat the fused optimizers convert to real here
     x = torch.view_as_complex(x)
@@ -620,36 +386,12 @@ def _contract_dense_pytorch(
 def get_contract_fun(
     weight, implementation="reconstructed", separable=False, operator_type="diagonal"
 ):  # pragma: no cover
-    """Generic ND implementation of Fourier Spectral Conv contraction
 
-    Parameters
-    ----------
-    weight : tensorly-torch's FactorizedTensor
-    implementation : {'reconstructed', 'factorized'}, default is 'reconstructed'
-        whether to reconstruct the weight and do a forward pass (reconstructed)
-        or contract directly the factors of the factorized weight with the input
-        (factorized)
-
-    Returns
-    -------
-    function : (x, weight) -> x * weight in Fourier space
-    """
     if implementation == "reconstructed":
         return _contract_dense
     elif implementation == "factorized":
         if torch.is_tensor(weight):
             return _contract_dense_pytorch
-        elif isinstance(weight, FactorizedTensor):
-            if weight.name.lower() == "complexdense" or weight.name.lower() == "dense":
-                return _contract_dense
-            elif weight.name.lower() == "complextucker":
-                return _contract_tucker
-            elif weight.name.lower() == "complextt":
-                return _contract_tt
-            elif weight.name.lower() == "complexcp":
-                return _contract_cp
-            else:
-                raise ValueError(f"Got unexpected factorized weight type {weight.name}")
         else:
             raise ValueError(
                 f"Got unexpected weight type of class {weight.__class__.__name__}"
@@ -716,8 +458,6 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
 
 
 
-
-
 @torch.jit.script
 def drop_path(
     x: torch.Tensor, drop_prob: float = 0.0, training: bool = False
@@ -755,35 +495,6 @@ class DropPath(nn.Module):
 
     def forward(self, x):  # pragma: no cover
         return drop_path(x, self.drop_prob, self.training)
-
-
-class PatchEmbed(nn.Module):
-    """
-    Divides the input image into patches and embeds them into a specified dimension
-    using a convolutional layer.
-    """
-
-    def __init__(
-        self, img_size=(224, 224), patch_size=(16, 16), in_chans=3, embed_dim=768
-    ):  # pragma: no cover
-        super(PatchEmbed, self).__init__()
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-        self.proj = nn.Conv2d(
-            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
-        )
-
-    def forward(self, x):  # pragma: no cover
-        # gather input
-        B, C, H, W = x.shape
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        # new: B, C, H*W
-        x = self.proj(x).flatten(2)
-        return x
 
 
 class MLP(nn.Module):
@@ -951,7 +662,7 @@ class SpectralConvS2(nn.Module):
         if not self.separable:
             weight_shape += [out_channels]
 
-        if isinstance(self.inverse_transform, DistributedInverseRealSHT):
+        if isinstance(self.inverse_transform, InverseRealSHT):
             self.modes_lat_local = self.inverse_transform.lmax_local
             self.modes_lon_local = self.inverse_transform.mmax_local
             self.lpad_local = self.inverse_transform.lpad_local
@@ -978,24 +689,12 @@ class SpectralConvS2(nn.Module):
         else:
             raise ValueError(f"Unsupported operator type f{self.operator_type}")
 
-        if use_tensorly:
-            # form weight tensors
-            self.weight = FactorizedTensor.new(
-                weight_shape,
-                rank=self.rank,
-                factorization=factorization,
-                fixed_rank_modes=False,
-                **decomposition_kwargs,
-            )
-            # initialization of weights
-            self.weight.normal_(0, scale)
+        assert factorization == "ComplexDense"
+        self.weight = nn.Parameter(scale * torch.randn(*weight_shape, 2))
+        if self.operator_type == "dhconv":
+            self.weight.is_shared_mp = ["matmul", "w"]
         else:
-            assert factorization == "ComplexDense"
-            self.weight = nn.Parameter(scale * torch.randn(*weight_shape, 2))
-            if self.operator_type == "dhconv":
-                self.weight.is_shared_mp = ["matmul", "w"]
-            else:
-                self.weight.is_shared_mp = ["matmul"]
+            self.weight.is_shared_mp = ["matmul"]
 
         # get the contraction handle
         self._contract = get_contract_fun(
@@ -1042,390 +741,6 @@ class SpectralConvS2(nn.Module):
         x = x.type(dtype)
 
         return x, residual
-
-
-class LocalConvS2(nn.Module):
-    """
-    S2 Convolution according to Driscoll & Healy
-    """
-
-    def __init__(
-        self,
-        forward_transform,
-        inverse_transform,
-        in_channels,
-        out_channels,
-        nradius=120,
-        scale="auto",
-        bias=False,
-    ):  # pragma: no cover
-        super(LocalConvS2, self).__init__()
-
-        if scale == "auto":
-            scale = 1 / (in_channels * out_channels)
-
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.nradius = nradius
-
-        self.forward_transform = forward_transform
-        self.zonal_transform = th.RealSHT(
-            forward_transform.nlat,
-            1,
-            lmax=forward_transform.lmax,
-            mmax=1,
-            grid=forward_transform.grid,
-        ).float()
-        self.inverse_transform = inverse_transform
-
-        self.modes_lat = self.inverse_transform.lmax
-        self.modes_lon = self.inverse_transform.mmax
-        self.output_dims = (self.inverse_transform.nlat, self.inverse_transform.nlon)
-
-        assert self.inverse_transform.lmax == self.modes_lat
-        assert self.inverse_transform.mmax == self.modes_lon
-
-        self.weight = nn.Parameter(
-            scale * torch.randn(in_channels, out_channels, nradius, 1)
-        )
-
-        self._contract = _contract_localconv_fwd
-
-        if bias:
-            self.bias = nn.Parameter(
-                scale * torch.randn(1, out_channels, *self.output_dims)
-            )
-
-    def forward(self, x):  # pragma: no cover
-
-        dtype = x.dtype
-        x = x.float()
-        B, C, H, W = x.shape
-
-        with amp.autocast(enabled=False):
-            f = torch.zeros(
-                (self.in_channels, self.out_channels, H, 1),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            f[..., : self.nradius, :] = self.weight
-
-            x = self.forward_transform(x)
-            f = self.zonal_transform(f)[..., :, 0]
-
-            x = torch.view_as_real(x)
-            f = torch.view_as_real(f)
-
-        x = self._contract(x, f)
-        x = x.contiguous()
-
-        x = torch.view_as_complex(x)
-
-        with amp.autocast(enabled=False):
-            x = self.inverse_transform(x)
-
-        if hasattr(self, "bias"):
-            x = x + self.bias
-
-        x = x.type(dtype)
-
-        return x
-
-
-class SpectralAttentionS2(nn.Module):
-    """
-    Spherical non-linear FNO layer
-    """
-
-    def __init__(
-        self,
-        forward_transform,
-        inverse_transform,
-        embed_dim,
-        operator_type="diagonal",
-        sparsity_threshold=0.0,
-        hidden_size_factor=2,
-        complex_activation="real",
-        scale="auto",
-        bias=False,
-        spectral_layers=1,
-        drop_rate=0.0,
-    ):  # pragma: no cover
-        super(SpectralAttentionS2, self).__init__()
-
-        self.embed_dim = embed_dim
-        self.sparsity_threshold = sparsity_threshold
-        self.operator_type = operator_type
-        self.spectral_layers = spectral_layers
-
-        if scale == "auto":
-            self.scale = 1 / (embed_dim * embed_dim)
-
-        self.modes_lat = forward_transform.lmax
-        self.modes_lon = forward_transform.mmax
-
-        # only storing the forward handle to be able to call it
-        self.forward_transform = forward_transform
-        self.inverse_transform = inverse_transform
-
-        self.scale_residual = (
-            self.forward_transform.nlat != self.inverse_transform.nlat
-        ) or (self.forward_transform.nlon != self.inverse_transform.nlon)
-
-        assert inverse_transform.lmax == self.modes_lat
-        assert inverse_transform.mmax == self.modes_lon
-
-        hidden_size = int(hidden_size_factor * self.embed_dim)
-
-        if operator_type == "diagonal":
-            self.mul_add_handle = compl_muladd2d_fwd
-            self.mul_handle = compl_mul2d_fwd
-
-            # weights
-            w = [self.scale * torch.randn(self.embed_dim, hidden_size, 2)]
-            for l in range(1, self.spectral_layers):
-                w.append(self.scale * torch.randn(hidden_size, hidden_size, 2))
-            self.w = nn.ParameterList(w)
-
-            self.wout = nn.Parameter(
-                self.scale * torch.randn(hidden_size, self.embed_dim, 2)
-            )
-
-            if bias:
-                self.b = nn.ParameterList(
-                    [
-                        self.scale * torch.randn(hidden_size, 1, 1, 2)
-                        for _ in range(self.spectral_layers)
-                    ]
-                )
-
-            self.activations = nn.ModuleList([])
-            for l in range(0, self.spectral_layers):
-                self.activations.append(
-                    ComplexReLU(
-                        mode=complex_activation,
-                        bias_shape=(hidden_size, 1, 1),
-                        scale=self.scale,
-                    )
-                )
-
-        elif operator_type == "l-dependant":
-
-            self.mul_add_handle = compl_exp_muladd2d_fwd
-            self.mul_handle = compl_exp_mul2d_fwd
-
-            # weights
-            w = [
-                self.scale * torch.randn(self.modes_lat, self.embed_dim, hidden_size, 2)
-            ]
-            for l in range(1, self.spectral_layers):
-                w.append(
-                    self.scale
-                    * torch.randn(self.modes_lat, hidden_size, hidden_size, 2)
-                )
-            self.w = nn.ParameterList(w)
-
-            if bias:
-                self.b = nn.ParameterList(
-                    [
-                        self.scale * torch.randn(hidden_size, 1, 1, 2)
-                        for _ in range(self.spectral_layers)
-                    ]
-                )
-
-            self.wout = nn.Parameter(
-                self.scale * torch.randn(self.modes_lat, hidden_size, self.embed_dim, 2)
-            )
-
-            self.activations = nn.ModuleList([])
-            for l in range(0, self.spectral_layers):
-                self.activations.append(
-                    ComplexReLU(
-                        mode=complex_activation,
-                        bias_shape=(hidden_size, 1, 1),
-                        scale=self.scale,
-                    )
-                )
-
-        else:
-            raise ValueError("Unknown operator type")
-
-        self.drop = nn.Dropout(drop_rate) if drop_rate > 0.0 else nn.Identity()
-
-    def forward_mlp(self, x):  # pragma: no cover
-        """forward pass of the MLP"""
-        B, C, H, W = x.shape
-
-        if self.operator_type == "block-separable":
-            x = x.permute(0, 3, 1, 2)
-
-        xr = torch.view_as_real(x)
-
-        for l in range(self.spectral_layers):
-            if hasattr(self, "b"):
-                xr = self.mul_add_handle(xr, self.w[l], self.b[l])
-            else:
-                xr = self.mul_handle(xr, self.w[l])
-            xr = torch.view_as_complex(xr)
-            xr = self.activations[l](xr)
-            xr = self.drop(xr)
-            xr = torch.view_as_real(xr)
-
-        # final MLP
-        x = self.mul_handle(xr, self.wout)
-
-        x = torch.view_as_complex(x)
-
-        if self.operator_type == "block-separable":
-            x = x.permute(0, 2, 3, 1)
-
-        return x
-
-    def forward(self, x):  # pragma: no cover
-
-        dtype = x.dtype
-        residual = x
-        x = x.to(torch.float32)
-
-        # FWD transform
-        with amp.autocast(enabled=False):
-            x = self.forward_transform(x)
-            if self.scale_residual:
-                x = x.contiguous()
-                residual = self.inverse_transform(x)
-                residual = residual.to(dtype)
-
-        # MLP
-        x = self.forward_mlp(x)
-
-        # BWD transform
-        x = x.contiguous()
-        with amp.autocast(enabled=False):
-            x = self.inverse_transform(x)
-
-        # cast back to initial precision
-        x = x.to(dtype)
-
-        return x, residual
-
-
-class RealSpectralAttentionS2(nn.Module):
-    """
-    Non-linear SFNO layer using a real-valued NN instead of a complex one
-    """
-
-    def __init__(
-        self,
-        forward_transform,
-        inverse_transform,
-        embed_dim,
-        operator_type="diagonal",
-        sparsity_threshold=0.0,
-        hidden_size_factor=2,
-        complex_activation="real",
-        scale="auto",
-        bias=False,
-        spectral_layers=1,
-        drop_rate=0.0,
-    ):  # pragma: no cover
-        super(RealSpectralAttentionS2, self).__init__()
-
-        self.embed_dim = embed_dim
-        self.sparsity_threshold = sparsity_threshold
-        self.operator_type = operator_type
-        self.spectral_layers = spectral_layers
-
-        if scale == "auto":
-            self.scale = 1 / (embed_dim * embed_dim)
-
-        self.modes_lat = forward_transform.lmax
-        self.modes_lon = forward_transform.mmax
-
-        # only storing the forward handle to be able to call it
-        self.forward_transform = forward_transform
-        self.inverse_transform = inverse_transform
-
-        self.scale_residual = (
-            self.forward_transform.nlat != self.inverse_transform.nlat
-        ) or (self.forward_transform.nlon != self.inverse_transform.nlon)
-
-        assert inverse_transform.lmax == self.modes_lat
-        assert inverse_transform.mmax == self.modes_lon
-
-        hidden_size = int(hidden_size_factor * self.embed_dim * 2)
-
-        self.mul_add_handle = real_muladd2d_fwd
-        self.mul_handle = real_mul2d_fwd
-
-        # weights
-        w = [self.scale * torch.randn(2 * self.embed_dim, hidden_size)]
-        for l in range(1, self.spectral_layers):
-            w.append(self.scale * torch.randn(hidden_size, hidden_size))
-        self.w = nn.ParameterList(w)
-
-        self.wout = nn.Parameter(
-            self.scale * torch.randn(hidden_size, 2 * self.embed_dim)
-        )
-
-        if bias:
-            self.b = nn.ParameterList(
-                [
-                    self.scale * torch.randn(hidden_size, 1, 1)
-                    for _ in range(self.spectral_layers)
-                ]
-            )
-
-        self.activations = nn.ModuleList([])
-        for l in range(0, self.spectral_layers):
-            self.activations.append(nn.ReLU())
-
-        self.drop = nn.Dropout(drop_rate) if drop_rate > 0.0 else nn.Identity()
-
-    def forward_mlp(self, x):  # pragma: no cover
-        """forward pass of the MLP"""
-        B, C, H, W = x.shape
-
-        xr = torch.view_as_real(x)
-        xr = xr.permute(0, 1, 4, 2, 3).reshape(B, C * 2, H, W)
-
-        for l in range(self.spectral_layers):
-            if hasattr(self, "b"):
-                xr = self.mul_add_handle(xr, self.w[l], self.b[l])
-            else:
-                xr = self.mul_handle(xr, self.w[l])
-            xr = self.activations[l](xr)
-            xr = self.drop(xr)
-
-        # final MLP
-        xr = self.mul_handle(xr, self.wout)
-
-        xr = xr.reshape(B, C, 2, H, W).permute(0, 1, 3, 4, 2)
-
-        x = torch.view_as_complex(xr)
-
-        return x
-
-    def forward(self, x):  # pragma: no cover
-
-        dtype = x.dtype
-        x = x.to(torch.float32)
-
-        # FWD transform
-        with amp.autocast(enabled=False):
-            x = self.forward_transform(x)
-
-        # MLP
-        x = self.forward_mlp(x)
-
-        # BWD transform
-        with amp.autocast(enabled=False):
-            x = self.inverse_transform(x)
-
-        # cast back to initial precision
-        x = x.to(dtype)
-
-        return x
-
 
 
 import torch
@@ -1808,520 +1123,6 @@ def gather_from_spatial_parallel_region(input_, dim):  # pragma: no cover
 
 # handler for additional gradient reductions
 # helper for gradient reduction across channel parallel ranks
-def init_gradient_reduction_hooks(
-    model,
-    device_ids,
-    output_device,
-    bucket_cap_mb=25,
-    broadcast_buffers=True,
-    find_unused_parameters=False,
-    gradient_as_bucket_view=True,
-    static_graph=False,
-):  # pragma: no cover
-    """
-    Initialize gradient reduction hooks for a given model.
-    """
-
-    # early exit if we are not in a distributed setting:
-    if not dist.is_initialized():
-        return model
-
-    # set this to false in init and then find out if we can use it:
-    need_hooks = False
-    ddp_group = comm.get_group("data")
-
-    # this is the trivial case
-    if comm.get_size("model") == 1:
-        # the simple case, we can just continue then
-        ddp_group = None
-    else:
-        # check if there are shared weights, otherwise we can skip
-        non_singleton_group_names = [
-            x
-            for x in comm.get_names()
-            if (comm.get_size(x) > 1) and not (x in ["data", "model", "spatial"])
-        ]
-        num_shared = {x: 0 for x in non_singleton_group_names}
-        num_parameters = 0
-
-        # count parameters and reduction groups
-        for param in model.parameters():
-
-            # if it does not have any annotation, we assume it is shared between all groups
-            if not hasattr(param, "is_shared_mp"):
-                param.is_shared_mp = non_singleton_group_names.copy()
-
-            # check remaining groups
-            for group in non_singleton_group_names:
-                if group in param.is_shared_mp:
-                    num_shared[group] += 1
-            num_parameters += 1
-
-        # group without data:
-        num_param_shared_model = [v for k, v in num_shared.items()]
-        if not num_param_shared_model:
-            num_shared_model = 0
-        else:
-            num_shared_model = sum(num_param_shared_model)
-
-        # if all parameters are just data shared and not additionally shared orthogonally to that, we can use DDP
-        if num_shared_model == 0:
-            ddp_group = None
-
-        elif all([(x == num_parameters) for x in num_param_shared_model]):
-            # in this case, we just need to register a backward hook to multiply the gradients according to the multiplicity:
-            print(
-                "Setting up gradient hooks to account for shared parameter multiplicity"
-            )
-            for param in model.parameters():
-                param.register_hook(lambda grad: grad * float(comm.get_size("model")))
-
-            ddp_group = None
-        else:
-            ddp_group = comm.get_group("data")  # double check if this is correct
-            broadcast_buffers = False
-            need_hooks = True
-
-    # we can set up DDP and exit here
-    print("Setting up DDP communication hooks")
-    model = DistributedDataParallel(
-        model,
-        device_ids=device_ids,
-        output_device=output_device,
-        bucket_cap_mb=bucket_cap_mb,
-        broadcast_buffers=broadcast_buffers,
-        find_unused_parameters=find_unused_parameters,
-        gradient_as_bucket_view=gradient_as_bucket_view,
-        static_graph=static_graph,
-        process_group=ddp_group,
-    )
-    if not need_hooks:
-        return model
-
-    print("Setting up custom communication hooks")
-
-    # define comm hook:
-    def reduction_comm_hook(
-        state: object, bucket: dist.GradBucket
-    ) -> torch.futures.Future[torch.Tensor]:  # pragma: no cover
-        """reduction comm hook"""
-
-        # allreduce everything first:
-        buff = bucket.buffer()
-
-        # get future for allreduce
-        fut = dist.all_reduce(
-            buff, op=dist.ReduceOp.AVG, group=comm.get_group("data"), async_op=True
-        ).get_future()
-
-        # get grads for shared weights
-        params = bucket.parameters()
-
-        def grad_reduction(fut, grads, group):
-            """reduce remaining gradients"""
-            coalesced = _flatten_dense_tensors(grads)
-            dist.all_reduce(
-                coalesced,
-                op=dist.ReduceOp.SUM,
-                group=comm.get_group(group),
-                async_op=False,
-            )
-            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
-                buf.copy_(synced)
-
-            return bucket.buffer()
-
-        for group in non_singleton_group_names:
-            if group == "data":
-                continue
-
-            grads = []
-            for p in params:
-                if group in p.is_shared_mp:
-                    grads.append(p.grad.data)
-
-            if not grads:
-                continue
-
-            # append the new reduction functions
-            fut = fut.then(lambda x: grad_reduction(x, grads=grads, group=group))
-            # fut = fut.then(lambda x: grad_copy(x, grads=grads))
-
-        ## chain it together
-        # for redfut, copyfut in zip(redfunc, copyfunc):
-        #    fut = fut.then(redfut).then(copyfut)
-
-        return fut
-
-    # register model comm hook
-    model.register_comm_hook(state=None, hook=reduction_comm_hook)
-
-    return model
-
-
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class distributed_transpose_w(torch.autograd.Function):
-    """Distributed transpose"""
-
-    @staticmethod
-    def forward(ctx, x, dim):  # pragma: no cover
-        xlist, _ = _transpose(x, dim[0], dim[1], group=comm.get_group("w"))
-        x = torch.cat(xlist, dim=dim[1])
-        ctx.dim = dim
-        return x
-
-    @staticmethod
-    def backward(ctx, go):  # pragma: no cover
-        dim = ctx.dim
-        gilist, _ = _transpose(go, dim[1], dim[0], group=comm.get_group("w"))
-        gi = torch.cat(gilist, dim=dim[0])
-        return gi, None
-
-
-class distributed_transpose_h(torch.autograd.Function):
-    """Distributed transpose"""
-
-    @staticmethod
-    def forward(ctx, x, dim):  # pragma: no cover
-        xlist, _ = _transpose(x, dim[0], dim[1], group=comm.get_group("h"))
-        x = torch.cat(xlist, dim=dim[1])
-        ctx.dim = dim
-        return x
-
-    @staticmethod
-    def backward(ctx, go):  # pragma: no cover
-        dim = ctx.dim
-        gilist, _ = _transpose(go, dim[1], dim[0], group=comm.get_group("h"))
-        gi = torch.cat(gilist, dim=dim[0])
-        return gi, None
-
-
-class DistributedRealFFT2(nn.Module):
-    """
-    Helper routine to wrap FFT similarly to the SHT
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None):  # pragma: no cover
-        super(DistributedRealFFT2, self).__init__()
-
-        # get the comms grid:
-        self.comm_size_h = comm.get_size("h")
-        self.comm_size_w = comm.get_size("w")
-        self.comm_rank_w = comm.get_rank("w")
-
-        # dimensions
-        self.nlat = nlat
-        self.nlon = nlon
-        self.lmax = lmax or self.nlat
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # frequency paddings
-        ldist = (self.lmax + self.comm_size_h - 1) // self.comm_size_h
-        self.lpad = ldist * self.comm_size_polar - self.lmax
-        mdist = (self.mmax + self.comm_size_w - 1) // self.comm_size_w
-        self.mpad = mdist * self.comm_size_w - self.mmax
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-
-        # we need to ensure that we can split the channels evenly
-        assert x.shape[1] % self.comm_size_h == 0
-        assert x.shape[1] % self.comm_size_w == 0
-
-        # h and w is split. First we make w local by transposing into channel dim
-        if self.comm_size_w > 1:
-            xt = distributed_transpose_w.apply(x, (1, -1))
-        else:
-            xt = x
-
-        # do first FFT
-        xtf = torch.fft.rfft(xt, n=self.nlon, dim=-1, norm="ortho")
-
-        # truncate
-        xtft = xtf[..., : self.mmax]
-
-        # pad the dim to allow for splitting
-        xtfp = F.pad(xtft, [0, self.mpad], mode="constant")
-
-        # transpose: after this, m is split and c is local
-        if self.comm_size_w > 1:
-            y = distributed_transpose_w.apply(xtfp, (-1, 1))
-        else:
-            y = xtfp
-
-        # transpose: after this, c is split and h is local
-        if self.comm_size_h > 1:
-            yt = distributed_transpose_h.apply(y, (1, -2))
-        else:
-            yt = y
-
-        # the input data might be padded, make sure to truncate to nlat:
-        # ytt = yt[..., :self.nlat, :]
-
-        # do second FFT:
-        yo = torch.fft.fft(yt, n=self.nlat, dim=-2, norm="ortho")
-
-        # pad if required, truncation is implicit
-        yop = F.pad(yo, [0, 0, 0, self.lpad], mode="constant")
-
-        # transpose: after this, l is split and c is local
-        if self.comm_size_h > 1:
-            y = distributed_transpose_h.apply(yop, (-2, 1))
-        else:
-            y = yop
-
-        return y
-
-
-class DistributedInverseRealFFT2(nn.Module):
-    """
-    Helper routine to wrap FFT similarly to the SHT
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None):  # pragma: no cover
-        super(DistributedInverseRealFFT2, self).__init__()
-
-        # get the comms grid:
-        self.comm_size_h = comm.get_size("h")
-        self.comm_size_w = comm.get_size("w")
-        self.comm_rank_w = comm.get_rank("w")
-
-        # dimensions
-        self.nlat = nlat
-        self.nlon = nlon
-        self.lmax = lmax or self.nlat
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # spatial paddings
-        latdist = (self.nlat + self.comm_size_h - 1) // self.comm_size_h
-        self.latpad = latdist * self.comm_size_h - self.nlat
-        londist = (self.nlon + self.comm_size_w - 1) // self.comm_size_w
-        self.lonpad = londist * self.comm_size_w - self.nlon
-
-        # frequency paddings
-        ldist = (self.lmax + self.comm_size_h - 1) // self.comm_size_h
-        self.lpad = ldist * self.comm_size_h - self.lmax
-        mdist = (self.mmax + self.comm_size_w - 1) // self.comm_size_w
-        self.mpad = mdist * self.comm_size_w - self.mmax
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-
-        # we need to ensure that we can split the channels evenly
-        assert x.shape[1] % self.comm_size_h == 0
-        assert x.shape[1] % self.comm_size_w == 0
-
-        # transpose: after that, channels are split, l is local:
-        if self.comm_size_h > 1:
-            xt = distributed_transpose_h.apply(x, (1, -2))
-        else:
-            xt = x
-
-        # truncate
-        xtt = xt[..., : self.lmax, :]
-
-        # do first fft
-        xf = torch.fft.ifft(xtt, n=self.nlat, dim=-2, norm="ortho")
-
-        # transpose: after this, l is split and channels are local
-        xfp = F.pad(xf, [0, 0, 0, self.latpad])
-
-        if self.comm_size_h > 1:
-            y = distributed_transpose_h.apply(xfp, (-2, 1))
-        else:
-            y = xfp
-
-        # transpose: after this, channels are split and m is local
-        if self.comm_size_w > 1:
-            yt = distributed_transpose_w.apply(y, (1, -1))
-        else:
-            yt = y
-
-        # truncate
-        ytt = yt[..., : self.mmax]
-
-        # apply the inverse (real) FFT
-        x = torch.fft.irfft(ytt, n=self.nlon, dim=-1, norm="ortho")
-
-        # pad before we transpose back
-        xp = F.pad(x, [0, self.lonpad])
-
-        # transpose: after this, m is split and channels are local
-        if self.comm_size_w > 1:
-            out = distributed_transpose_w.apply(xp, (-1, 1))
-        else:
-            out = xp
-
-        return out
-
-
-# more complicated layers
-class DistributedMLP(nn.Module):
-    """Distributed MLP layer"""
-
-    def __init__(
-        self,
-        in_features,
-        hidden_features=None,
-        out_features=None,
-        output_bias=True,
-        act_layer=nn.GELU,
-        drop_rate=0.0,
-        checkpointing=False,
-    ):  # pragma: no cover
-
-        super(DistributedMLP, self).__init__()
-        self.checkpointing = checkpointing
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-
-        # get effective embedding size:
-        comm_size = comm.get_size("matmul")
-        assert (
-            hidden_features % comm_size == 0
-        ), "Error, hidden_features needs to be divisible by matmul_parallel_size"
-        hidden_features_local = hidden_features // comm_size
-
-        # first set of hp
-        self.w1 = nn.Parameter(torch.ones(hidden_features_local, in_features, 1, 1))
-        self.b1 = nn.Parameter(torch.zeros(hidden_features_local))
-
-        # second set of hp
-        self.w2 = nn.Parameter(torch.ones(out_features, hidden_features_local, 1, 1))
-
-        if output_bias:
-            self.b2 = nn.Parameter(torch.zeros(out_features))
-
-        self.act = act_layer()
-        self.drop = nn.Dropout(drop) if drop_rate > 0.0 else nn.Identity()
-
-        # the weights are shared spatially
-        self.w1.is_shared_mp = ["h", "w"]
-        self.b1.is_shared_mp = ["h", "w"]
-        self.w2.is_shared_mp = ["h", "w"]
-        if output_bias:
-            self.b2.is_shared_mp = [
-                "matmul",
-                "h",
-                "w",
-            ]  # this one is shared between all ranks
-
-        # init weights
-        self._init_weights()
-
-    def _init_weights(self):  # pragma: no cover
-        trunc_normal_(self.w1, std=0.02)
-        nn.init.constant_(self.b1, 0.0)
-        trunc_normal_(self.w2, std=0.02)
-        if hasattr(self, "b2"):
-            nn.init.constant_(self.b2, 0.0)
-
-    def fwd(self, x):  # pragma: no cover
-        """Forward function."""
-        # we need to prepare paralellism here
-        # spatial parallelism
-        x = scatter_to_spatial_parallel_region(x, dim=-1)
-
-        # prepare the matmul parallel part
-        x = copy_to_matmul_parallel_region(x)
-
-        # do the mlp
-        x = F.conv2d(x, self.w1, bias=self.b1)
-        x = self.act(x)
-        x = self.drop(x)
-        x = F.conv2d(x, self.w2, bias=None)
-        x = reduce_from_matmul_parallel_region(x)
-        if hasattr(self, "b2"):
-            x = x + torch.reshape(self.b2, (1, -1, 1, 1))
-        x = self.drop(x)
-
-        # gather from spatial parallel region
-        x = gather_from_spatial_parallel_region(x, dim=-1)
-
-        return x
-
-    @torch.jit.ignore
-    def _checkpoint_forward(self, x):  # pragma: no cover
-        return checkpoint(self.fwd, x)
-
-    def forward(self, x):  # pragma: no cover
-        if self.checkpointing:
-            return self._checkpoint_forward(x)
-        else:
-            return self.fwd(x)
-
-
-class DistributedPatchEmbed(nn.Module):
-    """Distributed patch embedding layer"""
-
-    def __init__(
-        self,
-        img_size=(224, 224),
-        patch_size=(16, 16),
-        in_chans=3,
-        embed_dim=768,
-        input_is_matmul_parallel=False,
-        output_is_matmul_parallel=True,
-    ):  # pragma: no cover
-
-        super(DistributedPatchEmbed, self).__init__()
-
-        # store params
-        self.input_parallel = input_is_matmul_parallel
-        self.output_parallel = output_is_matmul_parallel
-
-        # get comm sizes:
-        matmul_comm_size = comm.get_size("matmul")
-        spatial_comm_size = comm.get_size("spatial")
-
-        # compute parameters
-        assert (
-            img_size[1] // patch_size[1]
-        ) % spatial_comm_size == 0, (
-            "Error, make sure that the spatial comm size evenly divides patched W"
-        )
-        num_patches = ((img_size[1] // patch_size[1]) // spatial_comm_size) * (
-            img_size[0] // patch_size[0]
-        )
-        self.img_size = (img_size[0], img_size[1] // spatial_comm_size)
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-
-        # get effective embedding size:
-        if self.output_parallel:
-            assert (
-                embed_dim % matmul_comm_size == 0
-            ), "Error, the embed_dim needs to be divisible by matmul_parallel_size"
-            out_chans_local = embed_dim // matmul_comm_size
-        else:
-            out_chans_local = embed_dim
-
-        # the weights  of this layer is shared across spatial parallel ranks
-        self.proj = nn.Conv2d(
-            in_chans, out_chans_local, kernel_size=patch_size, stride=patch_size
-        )
-
-        # make sure we reduce them across rank
-        self.proj.weight.is_shared_mp = ["h", "w"]
-        self.proj.bias.is_shared_mp = ["h", "w"]
-
-    def forward(self, x):  # pragma: no cover
-        if self.input_parallel:
-            x = gather_from_matmul_parallel_region(x, dim=1)
-
-        if self.output_parallel:
-            x = copy_to_matmul_parallel_region(x)
-
-        B, C, H, W = x.shape
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        # new: B, C, H*W
-        x = self.proj(x).flatten(2)
-        return x
 
 
 @torch.jit.script
@@ -2351,1005 +1152,6 @@ def compl_mul_add_fwd_c(
     res = tmp + cc
     return torch.view_as_real(res)
 
-
-class DistributedAFNO2Dv2(nn.Module):
-    """Distributed AFNO"""
-
-    def __init__(
-        self,
-        hidden_size,
-        num_blocks=8,
-        sparsity_threshold=0.01,
-        hard_thresholding_fraction=1,
-        hidden_size_factor=1,
-        input_is_matmul_parallel=False,
-        output_is_matmul_parallel=False,
-        use_complex_kernels=False,
-    ):  # pragma: no cover
-        """Distributed AFNO2Dv2"""
-        super(DistributedAFNO2Dv2, self).__init__()
-        assert (
-            hidden_size % num_blocks == 0
-        ), f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
-
-        # get comm sizes:
-        matmul_comm_size = comm.get_size("matmul")
-        self.spatial_comm_size = comm.get_size("spatial")
-
-        # select fft function handles
-        if self.spatial_comm_size > 1:
-            self.fft_handle = distributed_rfft2.apply
-            self.ifft_handle = distributed_irfft2.apply
-        else:
-            self.fft_handle = torch.fft.rfft2
-            self.ifft_handle = torch.fft.irfft2
-
-        self.hidden_size = hidden_size
-        self.sparsity_threshold = sparsity_threshold
-        self.num_blocks = num_blocks
-        assert (
-            self.num_blocks % matmul_comm_size == 0
-        ), "Error, num_blocks needs to be divisible by matmul_parallel_size"
-        self.num_blocks_local = self.num_blocks // matmul_comm_size
-        self.block_size = self.hidden_size // self.num_blocks
-        self.hard_thresholding_fraction = hard_thresholding_fraction
-        self.hidden_size_factor = hidden_size_factor
-        self.scale = 0.02
-        self.mult_handle = (
-            compl_mul_add_fwd_c if use_complex_kernels else compl_mul_add_fwd
-        )
-
-        # model paralellism
-        self.input_is_matmul_parallel = input_is_matmul_parallel
-        self.output_is_matmul_parallel = output_is_matmul_parallel
-
-        # new
-        # these weights need to be synced across all spatial ranks!
-        self.w1 = nn.Parameter(
-            self.scale
-            * torch.randn(
-                self.num_blocks_local,
-                self.block_size,
-                self.block_size * self.hidden_size_factor,
-                2,
-            )
-        )
-        self.b1 = nn.Parameter(
-            self.scale
-            * torch.randn(
-                self.num_blocks_local,
-                self.block_size * self.hidden_size_factor,
-                1,
-                1,
-                2,
-            )
-        )
-        self.w2 = nn.Parameter(
-            self.scale
-            * torch.randn(
-                self.num_blocks_local,
-                self.block_size * self.hidden_size_factor,
-                self.block_size,
-                2,
-            )
-        )
-        self.b2 = nn.Parameter(
-            self.scale * torch.randn(self.num_blocks_local, self.block_size, 1, 1, 2)
-        )
-
-        # make sure we reduce them across rank
-        self.w1.is_shared_mp = ["h", "w"]
-        self.b1.is_shared_mp = ["h", "w"]
-        self.w2.is_shared_mp = ["h", "w"]
-        self.b2.is_shared_mp = ["h", "w"]
-
-    def forward(self, x):  # pragma: no cover
-        if not self.input_is_matmul_parallel:
-            # distribute data
-            x = scatter_to_matmul_parallel_region(x, dim=1)
-
-        # bias
-        bias = x
-
-        dtype = x.dtype
-        x = x.float()
-        B, C, H, W_local = x.shape
-        total_modes = H // 2 + 1
-        kept_modes = int(total_modes * self.hard_thresholding_fraction)
-
-        H_local = H // self.spatial_comm_size
-        W = W_local * self.spatial_comm_size
-        x = self.fft_handle(x, (H, W), (-2, -1), "ortho")
-        x = x.view(B, self.num_blocks_local, self.block_size, H_local, W // 2 + 1)
-
-        # new
-        x = torch.view_as_real(x)
-        o2 = torch.zeros(x.shape, device=x.device)
-
-        o1 = F.relu(
-            self.mult_handle(
-                x[
-                    :,
-                    :,
-                    :,
-                    total_modes - kept_modes : total_modes + kept_modes,
-                    :kept_modes,
-                    :,
-                ],
-                self.w1,
-                self.b1,
-            )
-        )
-        o2[
-            :, :, :, total_modes - kept_modes : total_modes + kept_modes, :kept_modes, :
-        ] = self.mult_handle(o1, self.w2, self.b2)
-
-        # finalize
-        x = F.softshrink(o2, lambd=self.sparsity_threshold)
-        x = torch.view_as_complex(x)
-        x = x.reshape(B, C, H_local, W // 2 + 1)
-        x = self.ifft_handle(x, (H, W), (-2, -1), "ortho")
-        x = x.type(dtype) + bias
-
-        # gather
-        if not self.output_is_matmul_parallel:
-            x = gather_from_matmul_parallel_region(x, dim=1)
-
-        return x
-
-
-# generalized
-class _CopyToParallelRegion(torch.autograd.Function):
-    """Pass the input to the parallel region."""
-
-    @staticmethod
-    def symbolic(graph, input_, comm_id_):  # pragma: no cover
-        """symbolic method"""
-        return input_
-
-    @staticmethod
-    def forward(ctx, input_, comm_id_):  # pragma: no cover
-        ctx.comm_id = comm_id_
-        return input_
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        if comm.is_distributed(ctx.comm_id):  # pragma: no cover
-            return _reduce(grad_output, group=comm.get_group(ctx.comm_id)), None
-        else:
-            return grad_output, None
-
-
-class _ReduceFromParallelRegion(torch.autograd.Function):
-    """All-reduce the input from the parallel region."""
-
-    @staticmethod
-    def symbolic(graph, input_, comm_id_):  # pragma: no cover
-        """symbolic method"""
-        if comm.is_distributed(comm_id_):
-            return _reduce(input_, group=comm.get_group(comm_id_))
-        else:
-            return input_
-
-    @staticmethod
-    def forward(ctx, input_, comm_id_):  # pragma: no cover
-        if comm.is_distributed(comm_id_):
-            return _reduce(input_, group=comm.get_group(comm_id_))
-        else:
-            return input_
-
-    @staticmethod
-    def backward(ctx, grad_output):  # pragma: no cover
-        return grad_output, None
-
-
-class _ScatterToParallelRegion(torch.autograd.Function):
-    """Split the input and keep only the corresponding chuck to the rank."""
-
-    @staticmethod
-    def symbolic(graph, input_, dim_, comm_id_):  # pragma: no cover
-        """symbolic method"""
-        return _split(input_, dim_, group=comm.get_group(comm_id_))
-
-    @staticmethod
-    def forward(ctx, input_, dim_, comm_id_):  # pragma: no cover
-        ctx.dim = dim_
-        ctx.comm_id = comm_id_
-        if comm.is_distributed(comm_id_):
-            return _split(input_, dim_, group=comm.get_group(comm_id_))
-        else:
-            return input_
-
-    @staticmethod
-    def backward(ctx, grad_output):  # pragma: no cover
-        if comm.is_distributed(ctx.comm_id):
-            return (
-                _gather(grad_output, ctx.dim, group=comm.get_group(ctx.comm_id)),
-                None,
-                None,
-            )
-        else:
-            return grad_output, None, None
-
-
-class _GatherFromParallelRegion(torch.autograd.Function):
-    """Gather the input from parallel region and concatenate."""
-
-    @staticmethod
-    def symbolic(graph, input_, dim_, comm_id_):  # pragma: no cover
-        """"""
-        if comm.is_distributed(comm_id_):
-            return _gather(input_, dim_, group=comm.get_group(comm_id_))
-        else:
-            return input_
-
-    @staticmethod
-    def forward(ctx, input_, dim_, comm_id_):  # pragma: no cover
-        ctx.dim = dim_
-        ctx.comm_id = comm_id_
-        if comm.is_distributed(comm_id_):
-            return _gather(input_, dim_, group=comm.get_group(comm_id_))
-        else:
-            return input_
-
-    @staticmethod
-    def backward(ctx, grad_output):  # pragma: no cover
-        if comm.is_distributed(ctx.comm_id):
-            return (
-                _split(grad_output, ctx.dim, group=comm.get_group(ctx.comm_id)),
-                None,
-                None,
-            )
-        else:
-            return grad_output, None, None
-
-
-# -----------------
-# Helper functions.
-# -----------------
-# matmul parallel
-def copy_to_matmul_parallel_region(input_):  # pragma: no cover
-    """copy helper"""
-    return _CopyToParallelRegion.apply(input_, "matmul")
-
-
-def reduce_from_matmul_parallel_region(input_):  # pragma: no cover
-    """reduce helper"""
-    return _ReduceFromParallelRegion.apply(input_, "matmul")
-
-
-def scatter_to_matmul_parallel_region(input_, dim):  # pragma: no cover
-    """scatter helper"""
-    return _ScatterToParallelRegion.apply(input_, dim, "matmul")
-
-
-def gather_from_matmul_parallel_region(input_, dim):  # pragma: no cover
-    """gather helper"""
-    return _GatherFromParallelRegion.apply(input_, dim, "matmul")
-
-
-# general
-def reduce_from_parallel_region(input_, comm_name):  # pragma: no cover
-    """reduce helper"""
-    return _ReduceFromParallelRegion.apply(input_, comm_name)
-
-
-def scatter_to_parallel_region(input_, dim, comm_name):  # pragma: no cover
-    """scatter helper"""
-    return _ScatterToParallelRegion.apply(input_, dim, comm_name)
-
-
-def gather_from_parallel_region(input_, dim, comm_name):  # pragma: no cover
-    """gather helper"""
-    return _GatherFromParallelRegion.apply(input_, dim, comm_name)
-
-
-# def gather_within_matmul_parallel_region(input_, dim):
-#    return _GatherWithinMatmulParallelRegion.apply(input_, dim, "matmul")
-
-# spatial parallel
-def copy_to_spatial_parallel_region(input_):  # pragma: no cover
-    """copy helper"""
-    return _CopyToParallelRegion.apply(input_, "spatial")
-
-
-def scatter_to_spatial_parallel_region(input_, dim):  # pragma: no cover
-    """scatter helper"""
-    return _ScatterToParallelRegion.apply(input_, dim, "spatial")
-
-
-def gather_from_spatial_parallel_region(input_, dim):  # pragma: no cover
-    """gather helper"""
-    return _GatherFromParallelRegion.apply(input_, dim, "spatial")
-
-
-# handler for additional gradient reductions
-# helper for gradient reduction across channel parallel ranks
-def init_gradient_reduction_hooks(
-    model,
-    device_ids,
-    output_device,
-    bucket_cap_mb=25,
-    broadcast_buffers=True,
-    find_unused_parameters=False,
-    gradient_as_bucket_view=True,
-    static_graph=False,
-):  # pragma: no cover
-    """
-    Initialize gradient reduction hooks for a given model.
-    """
-
-    # early exit if we are not in a distributed setting:
-    if not dist.is_initialized():
-        return model
-
-    # set this to false in init and then find out if we can use it:
-    need_hooks = False
-    ddp_group = comm.get_group("data")
-
-    # this is the trivial case
-    if comm.get_size("model") == 1:
-        # the simple case, we can just continue then
-        ddp_group = None
-    else:
-        # check if there are shared weights, otherwise we can skip
-        non_singleton_group_names = [
-            x
-            for x in comm.get_names()
-            if (comm.get_size(x) > 1) and not (x in ["data", "model", "spatial"])
-        ]
-        num_shared = {x: 0 for x in non_singleton_group_names}
-        num_parameters = 0
-
-        # count parameters and reduction groups
-        for param in model.parameters():
-
-            # if it does not have any annotation, we assume it is shared between all groups
-            if not hasattr(param, "is_shared_mp"):
-                param.is_shared_mp = non_singleton_group_names.copy()
-
-            # check remaining groups
-            for group in non_singleton_group_names:
-                if group in param.is_shared_mp:
-                    num_shared[group] += 1
-            num_parameters += 1
-
-        # group without data:
-        num_param_shared_model = [v for k, v in num_shared.items()]
-        if not num_param_shared_model:
-            num_shared_model = 0
-        else:
-            num_shared_model = sum(num_param_shared_model)
-
-        # if all parameters are just data shared and not additionally shared orthogonally to that, we can use DDP
-        if num_shared_model == 0:
-            ddp_group = None
-
-        elif all([(x == num_parameters) for x in num_param_shared_model]):
-            # in this case, we just need to register a backward hook to multiply the gradients according to the multiplicity:
-            print(
-                "Setting up gradient hooks to account for shared parameter multiplicity"
-            )
-            for param in model.parameters():
-                param.register_hook(lambda grad: grad * float(comm.get_size("model")))
-
-            ddp_group = None
-        else:
-            ddp_group = comm.get_group("data")  # double check if this is correct
-            broadcast_buffers = False
-            need_hooks = True
-
-    # we can set up DDP and exit here
-    print("Setting up DDP communication hooks")
-    model = DistributedDataParallel(
-        model,
-        device_ids=device_ids,
-        output_device=output_device,
-        bucket_cap_mb=bucket_cap_mb,
-        broadcast_buffers=broadcast_buffers,
-        find_unused_parameters=find_unused_parameters,
-        gradient_as_bucket_view=gradient_as_bucket_view,
-        static_graph=static_graph,
-        process_group=ddp_group,
-    )
-    if not need_hooks:
-        return model
-
-    print("Setting up custom communication hooks")
-
-    # define comm hook:
-    def reduction_comm_hook(
-        state: object, bucket: dist.GradBucket
-    ) -> torch.futures.Future[torch.Tensor]:  # pragma: no cover
-        """reduction comm hook"""
-
-        # allreduce everything first:
-        buff = bucket.buffer()
-
-        # get future for allreduce
-        fut = dist.all_reduce(
-            buff, op=dist.ReduceOp.AVG, group=comm.get_group("data"), async_op=True
-        ).get_future()
-
-        # get grads for shared weights
-        params = bucket.parameters()
-
-        def grad_reduction(fut, grads, group):
-            """reduce remaining gradients"""
-            coalesced = _flatten_dense_tensors(grads)
-            dist.all_reduce(
-                coalesced,
-                op=dist.ReduceOp.SUM,
-                group=comm.get_group(group),
-                async_op=False,
-            )
-            for buf, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
-                buf.copy_(synced)
-
-            return bucket.buffer()
-
-        for group in non_singleton_group_names:
-            if group == "data":
-                continue
-
-            grads = []
-            for p in params:
-                if group in p.is_shared_mp:
-                    grads.append(p.grad.data)
-
-            if not grads:
-                continue
-
-            # append the new reduction functions
-            fut = fut.then(lambda x: grad_reduction(x, grads=grads, group=group))
-            # fut = fut.then(lambda x: grad_copy(x, grads=grads))
-
-        ## chain it together
-        # for redfut, copyfut in zip(redfunc, copyfunc):
-        #    fut = fut.then(redfut).then(copyfut)
-
-        return fut
-
-    # register model comm hook
-    model.register_comm_hook(state=None, hook=reduction_comm_hook)
-
-    return model
-
-
-
-
-
-class distributed_transpose_w(torch.autograd.Function):
-    """Distributed transpose"""
-
-    @staticmethod
-    def forward(ctx, x, dim):  # pragma: no cover
-        xlist, _ = _transpose(x, dim[0], dim[1], group=comm.get_group("w"))
-        x = torch.cat(xlist, dim=dim[1])
-        ctx.dim = dim
-        return x
-
-    @staticmethod
-    def backward(ctx, go):  # pragma: no cover
-        dim = ctx.dim
-        gilist, _ = _transpose(go, dim[1], dim[0], group=comm.get_group("w"))
-        gi = torch.cat(gilist, dim=dim[0])
-        return gi, None
-
-
-class distributed_transpose_h(torch.autograd.Function):
-    """Distributed transpose"""
-
-    @staticmethod
-    def forward(ctx, x, dim):  # pragma: no cover
-        xlist, _ = _transpose(x, dim[0], dim[1], group=comm.get_group("h"))
-        x = torch.cat(xlist, dim=dim[1])
-        ctx.dim = dim
-        return x
-
-    @staticmethod
-    def backward(ctx, go):  # pragma: no cover
-        dim = ctx.dim
-        gilist, _ = _transpose(go, dim[1], dim[0], group=comm.get_group("h"))
-        gi = torch.cat(gilist, dim=dim[0])
-        return gi, None
-
-
-class DistributedRealFFT2(nn.Module):
-    """
-    Helper routine to wrap FFT similarly to the SHT
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None):  # pragma: no cover
-        super(DistributedRealFFT2, self).__init__()
-
-        # get the comms grid:
-        self.comm_size_h = comm.get_size("h")
-        self.comm_size_w = comm.get_size("w")
-        self.comm_rank_w = comm.get_rank("w")
-
-        # dimensions
-        self.nlat = nlat
-        self.nlon = nlon
-        self.lmax = lmax or self.nlat
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # frequency paddings
-        ldist = (self.lmax + self.comm_size_h - 1) // self.comm_size_h
-        self.lpad = ldist * self.comm_size_polar - self.lmax
-        mdist = (self.mmax + self.comm_size_w - 1) // self.comm_size_w
-        self.mpad = mdist * self.comm_size_w - self.mmax
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-
-        # we need to ensure that we can split the channels evenly
-        assert x.shape[1] % self.comm_size_h == 0
-        assert x.shape[1] % self.comm_size_w == 0
-
-        # h and w is split. First we make w local by transposing into channel dim
-        if self.comm_size_w > 1:
-            xt = distributed_transpose_w.apply(x, (1, -1))
-        else:
-            xt = x
-
-        # do first FFT
-        xtf = torch.fft.rfft(xt, n=self.nlon, dim=-1, norm="ortho")
-
-        # truncate
-        xtft = xtf[..., : self.mmax]
-
-        # pad the dim to allow for splitting
-        xtfp = F.pad(xtft, [0, self.mpad], mode="constant")
-
-        # transpose: after this, m is split and c is local
-        if self.comm_size_w > 1:
-            y = distributed_transpose_w.apply(xtfp, (-1, 1))
-        else:
-            y = xtfp
-
-        # transpose: after this, c is split and h is local
-        if self.comm_size_h > 1:
-            yt = distributed_transpose_h.apply(y, (1, -2))
-        else:
-            yt = y
-
-        # the input data might be padded, make sure to truncate to nlat:
-        # ytt = yt[..., :self.nlat, :]
-
-        # do second FFT:
-        yo = torch.fft.fft(yt, n=self.nlat, dim=-2, norm="ortho")
-
-        # pad if required, truncation is implicit
-        yop = F.pad(yo, [0, 0, 0, self.lpad], mode="constant")
-
-        # transpose: after this, l is split and c is local
-        if self.comm_size_h > 1:
-            y = distributed_transpose_h.apply(yop, (-2, 1))
-        else:
-            y = yop
-
-        return y
-
-
-class DistributedInverseRealFFT2(nn.Module):
-    """
-    Helper routine to wrap FFT similarly to the SHT
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None):  # pragma: no cover
-        super(DistributedInverseRealFFT2, self).__init__()
-
-        # get the comms grid:
-        self.comm_size_h = comm.get_size("h")
-        self.comm_size_w = comm.get_size("w")
-        self.comm_rank_w = comm.get_rank("w")
-
-        # dimensions
-        self.nlat = nlat
-        self.nlon = nlon
-        self.lmax = lmax or self.nlat
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # spatial paddings
-        latdist = (self.nlat + self.comm_size_h - 1) // self.comm_size_h
-        self.latpad = latdist * self.comm_size_h - self.nlat
-        londist = (self.nlon + self.comm_size_w - 1) // self.comm_size_w
-        self.lonpad = londist * self.comm_size_w - self.nlon
-
-        # frequency paddings
-        ldist = (self.lmax + self.comm_size_h - 1) // self.comm_size_h
-        self.lpad = ldist * self.comm_size_h - self.lmax
-        mdist = (self.mmax + self.comm_size_w - 1) // self.comm_size_w
-        self.mpad = mdist * self.comm_size_w - self.mmax
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-
-        # we need to ensure that we can split the channels evenly
-        assert x.shape[1] % self.comm_size_h == 0
-        assert x.shape[1] % self.comm_size_w == 0
-
-        # transpose: after that, channels are split, l is local:
-        if self.comm_size_h > 1:
-            xt = distributed_transpose_h.apply(x, (1, -2))
-        else:
-            xt = x
-
-        # truncate
-        xtt = xt[..., : self.lmax, :]
-
-        # do first fft
-        xf = torch.fft.ifft(xtt, n=self.nlat, dim=-2, norm="ortho")
-
-        # transpose: after this, l is split and channels are local
-        xfp = F.pad(xf, [0, 0, 0, self.latpad])
-
-        if self.comm_size_h > 1:
-            y = distributed_transpose_h.apply(xfp, (-2, 1))
-        else:
-            y = xfp
-
-        # transpose: after this, channels are split and m is local
-        if self.comm_size_w > 1:
-            yt = distributed_transpose_w.apply(y, (1, -1))
-        else:
-            yt = y
-
-        # truncate
-        ytt = yt[..., : self.mmax]
-
-        # apply the inverse (real) FFT
-        x = torch.fft.irfft(ytt, n=self.nlon, dim=-1, norm="ortho")
-
-        # pad before we transpose back
-        xp = F.pad(x, [0, self.lonpad])
-
-        # transpose: after this, m is split and channels are local
-        if self.comm_size_w > 1:
-            out = distributed_transpose_w.apply(xp, (-1, 1))
-        else:
-            out = xp
-
-        return out
-
-
-# more complicated layers
-class DistributedMLP(nn.Module):
-    """Distributed MLP layer"""
-
-    def __init__(
-        self,
-        in_features,
-        hidden_features=None,
-        out_features=None,
-        output_bias=True,
-        act_layer=nn.GELU,
-        drop_rate=0.0,
-        checkpointing=False,
-    ):  # pragma: no cover
-
-        super(DistributedMLP, self).__init__()
-        self.checkpointing = checkpointing
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-
-        # get effective embedding size:
-        comm_size = comm.get_size("matmul")
-        assert (
-            hidden_features % comm_size == 0
-        ), "Error, hidden_features needs to be divisible by matmul_parallel_size"
-        hidden_features_local = hidden_features // comm_size
-
-        # first set of hp
-        self.w1 = nn.Parameter(torch.ones(hidden_features_local, in_features, 1, 1))
-        self.b1 = nn.Parameter(torch.zeros(hidden_features_local))
-
-        # second set of hp
-        self.w2 = nn.Parameter(torch.ones(out_features, hidden_features_local, 1, 1))
-
-        if output_bias:
-            self.b2 = nn.Parameter(torch.zeros(out_features))
-
-        self.act = act_layer()
-        self.drop = nn.Dropout(drop) if drop_rate > 0.0 else nn.Identity()
-
-        # the weights are shared spatially
-        self.w1.is_shared_mp = ["h", "w"]
-        self.b1.is_shared_mp = ["h", "w"]
-        self.w2.is_shared_mp = ["h", "w"]
-        if output_bias:
-            self.b2.is_shared_mp = [
-                "matmul",
-                "h",
-                "w",
-            ]  # this one is shared between all ranks
-
-        # init weights
-        self._init_weights()
-
-    def _init_weights(self):  # pragma: no cover
-        trunc_normal_(self.w1, std=0.02)
-        nn.init.constant_(self.b1, 0.0)
-        trunc_normal_(self.w2, std=0.02)
-        if hasattr(self, "b2"):
-            nn.init.constant_(self.b2, 0.0)
-
-    def fwd(self, x):  # pragma: no cover
-        """Forward function."""
-        # we need to prepare paralellism here
-        # spatial parallelism
-        x = scatter_to_spatial_parallel_region(x, dim=-1)
-
-        # prepare the matmul parallel part
-        x = copy_to_matmul_parallel_region(x)
-
-        # do the mlp
-        x = F.conv2d(x, self.w1, bias=self.b1)
-        x = self.act(x)
-        x = self.drop(x)
-        x = F.conv2d(x, self.w2, bias=None)
-        x = reduce_from_matmul_parallel_region(x)
-        if hasattr(self, "b2"):
-            x = x + torch.reshape(self.b2, (1, -1, 1, 1))
-        x = self.drop(x)
-
-        # gather from spatial parallel region
-        x = gather_from_spatial_parallel_region(x, dim=-1)
-
-        return x
-
-    @torch.jit.ignore
-    def _checkpoint_forward(self, x):  # pragma: no cover
-        return checkpoint(self.fwd, x)
-
-    def forward(self, x):  # pragma: no cover
-        if self.checkpointing:
-            return self._checkpoint_forward(x)
-        else:
-            return self.fwd(x)
-
-
-class DistributedPatchEmbed(nn.Module):
-    """Distributed patch embedding layer"""
-
-    def __init__(
-        self,
-        img_size=(224, 224),
-        patch_size=(16, 16),
-        in_chans=3,
-        embed_dim=768,
-        input_is_matmul_parallel=False,
-        output_is_matmul_parallel=True,
-    ):  # pragma: no cover
-
-        super(DistributedPatchEmbed, self).__init__()
-
-        # store params
-        self.input_parallel = input_is_matmul_parallel
-        self.output_parallel = output_is_matmul_parallel
-
-        # get comm sizes:
-        matmul_comm_size = comm.get_size("matmul")
-        spatial_comm_size = comm.get_size("spatial")
-
-        # compute parameters
-        assert (
-            img_size[1] // patch_size[1]
-        ) % spatial_comm_size == 0, (
-            "Error, make sure that the spatial comm size evenly divides patched W"
-        )
-        num_patches = ((img_size[1] // patch_size[1]) // spatial_comm_size) * (
-            img_size[0] // patch_size[0]
-        )
-        self.img_size = (img_size[0], img_size[1] // spatial_comm_size)
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-
-        # get effective embedding size:
-        if self.output_parallel:
-            assert (
-                embed_dim % matmul_comm_size == 0
-            ), "Error, the embed_dim needs to be divisible by matmul_parallel_size"
-            out_chans_local = embed_dim // matmul_comm_size
-        else:
-            out_chans_local = embed_dim
-
-        # the weights  of this layer is shared across spatial parallel ranks
-        self.proj = nn.Conv2d(
-            in_chans, out_chans_local, kernel_size=patch_size, stride=patch_size
-        )
-
-        # make sure we reduce them across rank
-        self.proj.weight.is_shared_mp = ["h", "w"]
-        self.proj.bias.is_shared_mp = ["h", "w"]
-
-    def forward(self, x):  # pragma: no cover
-        if self.input_parallel:
-            x = gather_from_matmul_parallel_region(x, dim=1)
-
-        if self.output_parallel:
-            x = copy_to_matmul_parallel_region(x)
-
-        B, C, H, W = x.shape
-        assert (
-            H == self.img_size[0] and W == self.img_size[1]
-        ), f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        # new: B, C, H*W
-        x = self.proj(x).flatten(2)
-        return x
-
-
-@torch.jit.script
-def compl_mul_add_fwd(
-    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
-) -> torch.Tensor:  # pragma: no cover
-    """complex multiplication and addition"""
-    tmp = torch.einsum("bkixys,kiot->stbkoxy", a, b)
-    res = (
-        torch.stack(
-            [tmp[0, 0, ...] - tmp[1, 1, ...], tmp[1, 0, ...] + tmp[0, 1, ...]], dim=-1
-        )
-        + c
-    )
-    return res
-
-
-@torch.jit.script
-def compl_mul_add_fwd_c(
-    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
-) -> torch.Tensor:  # pragma: no cover
-    """Performs a complex multiplication and addition operation on three tensors"""
-    ac = torch.view_as_complex(a)
-    bc = torch.view_as_complex(b)
-    cc = torch.view_as_complex(c)
-    tmp = torch.einsum("bkixy,kio->bkoxy", ac, bc)
-    res = tmp + cc
-    return torch.view_as_real(res)
-
-
-class DistributedAFNO2Dv2(nn.Module):
-    """Distributed AFNO"""
-
-    def __init__(
-        self,
-        hidden_size,
-        num_blocks=8,
-        sparsity_threshold=0.01,
-        hard_thresholding_fraction=1,
-        hidden_size_factor=1,
-        input_is_matmul_parallel=False,
-        output_is_matmul_parallel=False,
-        use_complex_kernels=False,
-    ):  # pragma: no cover
-        """Distributed AFNO2Dv2"""
-        super(DistributedAFNO2Dv2, self).__init__()
-        assert (
-            hidden_size % num_blocks == 0
-        ), f"hidden_size {hidden_size} should be divisble by num_blocks {num_blocks}"
-
-        # get comm sizes:
-        matmul_comm_size = comm.get_size("matmul")
-        self.spatial_comm_size = comm.get_size("spatial")
-
-        # select fft function handles
-        if self.spatial_comm_size > 1:
-            self.fft_handle = distributed_rfft2.apply
-            self.ifft_handle = distributed_irfft2.apply
-        else:
-            self.fft_handle = torch.fft.rfft2
-            self.ifft_handle = torch.fft.irfft2
-
-        self.hidden_size = hidden_size
-        self.sparsity_threshold = sparsity_threshold
-        self.num_blocks = num_blocks
-        assert (
-            self.num_blocks % matmul_comm_size == 0
-        ), "Error, num_blocks needs to be divisible by matmul_parallel_size"
-        self.num_blocks_local = self.num_blocks // matmul_comm_size
-        self.block_size = self.hidden_size // self.num_blocks
-        self.hard_thresholding_fraction = hard_thresholding_fraction
-        self.hidden_size_factor = hidden_size_factor
-        self.scale = 0.02
-        self.mult_handle = (
-            compl_mul_add_fwd_c if use_complex_kernels else compl_mul_add_fwd
-        )
-
-        # model paralellism
-        self.input_is_matmul_parallel = input_is_matmul_parallel
-        self.output_is_matmul_parallel = output_is_matmul_parallel
-
-        # new
-        # these weights need to be synced across all spatial ranks!
-        self.w1 = nn.Parameter(
-            self.scale
-            * torch.randn(
-                self.num_blocks_local,
-                self.block_size,
-                self.block_size * self.hidden_size_factor,
-                2,
-            )
-        )
-        self.b1 = nn.Parameter(
-            self.scale
-            * torch.randn(
-                self.num_blocks_local,
-                self.block_size * self.hidden_size_factor,
-                1,
-                1,
-                2,
-            )
-        )
-        self.w2 = nn.Parameter(
-            self.scale
-            * torch.randn(
-                self.num_blocks_local,
-                self.block_size * self.hidden_size_factor,
-                self.block_size,
-                2,
-            )
-        )
-        self.b2 = nn.Parameter(
-            self.scale * torch.randn(self.num_blocks_local, self.block_size, 1, 1, 2)
-        )
-
-        # make sure we reduce them across rank
-        self.w1.is_shared_mp = ["h", "w"]
-        self.b1.is_shared_mp = ["h", "w"]
-        self.w2.is_shared_mp = ["h", "w"]
-        self.b2.is_shared_mp = ["h", "w"]
-
-    def forward(self, x):  # pragma: no cover
-        if not self.input_is_matmul_parallel:
-            # distribute data
-            x = scatter_to_matmul_parallel_region(x, dim=1)
-
-        # bias
-        bias = x
-
-        dtype = x.dtype
-        x = x.float()
-        B, C, H, W_local = x.shape
-        total_modes = H // 2 + 1
-        kept_modes = int(total_modes * self.hard_thresholding_fraction)
-
-        H_local = H // self.spatial_comm_size
-        W = W_local * self.spatial_comm_size
-        x = self.fft_handle(x, (H, W), (-2, -1), "ortho")
-        x = x.view(B, self.num_blocks_local, self.block_size, H_local, W // 2 + 1)
-
-        # new
-        x = torch.view_as_real(x)
-        o2 = torch.zeros(x.shape, device=x.device)
-
-        o1 = F.relu(
-            self.mult_handle(
-                x[
-                    :,
-                    :,
-                    :,
-                    total_modes - kept_modes : total_modes + kept_modes,
-                    :kept_modes,
-                    :,
-                ],
-                self.w1,
-                self.b1,
-            )
-        )
-        o2[
-            :, :, :, total_modes - kept_modes : total_modes + kept_modes, :kept_modes, :
-        ] = self.mult_handle(o1, self.w2, self.b2)
-
-        # finalize
-        x = F.softshrink(o2, lambd=self.sparsity_threshold)
-        x = torch.view_as_complex(x)
-        x = x.reshape(B, C, H_local, W // 2 + 1)
-        x = self.ifft_handle(x, (H, W), (-2, -1), "ortho")
-        x = x.type(dtype) + bias
-
-        # gather
-        if not self.output_is_matmul_parallel:
-            x = gather_from_matmul_parallel_region(x, dim=1)
-
-        return x
 
 
 _format = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -3734,621 +1536,8 @@ class comm:
             logging.info("Finished Wireup")
 
         return
-
-
-class DistributedInstanceNorm2d(nn.Module):
-    """
-    Computes a distributed instance norm using Welford's online algorithm
-    """
-
-    def __init__(
-        self, num_features, eps=1e-05, affine=False, device=None, dtype=None
-    ):  # pragma: no cover
-        super(DistributedInstanceNorm2d, self).__init__()
-
-        self.eps = eps
-        self.affine = affine
-        if self.affine:
-            self.weight = nn.Parameter(torch.ones(1, num_features, 1, 1))
-            self.bias = nn.Parameter(torch.zeros(1, num_features, 1, 1))
-            self.weight.is_shared_mp = ["h", "w"]
-            self.bias.is_shared_mp = ["h", "w"]
-
-        self.gather_mode = "welford"
-
-    @torch.jit.ignore
-    def _gather_hw(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-        # gather the data over the spatial communicator
-        xh = gather_from_parallel_region(x, -2, "h")
-        xw = gather_from_parallel_region(xh, -1, "w")
-        return xw
-
-    @torch.jit.ignore
-    def _gather_spatial(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-        # gather the data over the spatial communicator
-        xs = gather_from_parallel_region(x, -1, "spatial")
-        return xs
-
-    def _stats_naive(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover
-        """Computes the statistics in the naive way by first gathering the tensors and then computing them"""
-
-        x = self._gather_hw(x)
-        var, mean = torch.var_mean(x, dim=(-2, -1), unbiased=False, keepdim=True)
-
-        return var, mean
-
-    def _stats_welford(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover
-        """Computes the statistics locally, then uses the Welford online algorithm to reduce them"""
-
-        var, mean = torch.var_mean(x, dim=(-2, -1), unbiased=False, keepdim=False)
-        # workaround to not use shapes, as otherwise cuda graphs won't work
-        count = torch.ones_like(x[0, 0], requires_grad=False)
-        count = torch.sum(count, dim=(-2, -1), keepdim=False)
-
-        vars = self._gather_spatial(var.unsqueeze(-1))
-        means = self._gather_spatial(mean.unsqueeze(-1))
-        counts = self._gather_spatial(count.unsqueeze(-1))
-
-        m2s = vars * counts
-
-        mean = means[..., 0]
-        m2 = m2s[..., 0]
-        count = counts[..., 0]
-
-        # use Welford's algorithm to accumulate them into a single mean and variance
-        for i in range(1, comm.get_size("spatial")):
-            delta = means[..., i] - mean
-            m2 = (
-                m2
-                + m2s[..., i]
-                + delta**2 * count * counts[..., i] / (count + counts[..., i])
-            )
-            if i == 1:
-                mean = (mean * count + means[..., i] * counts[..., i]) / (
-                    count + counts[..., i]
-                )
-            else:
-                mean = mean + delta * counts[..., i] / (count + counts[..., i])
-
-            # update the current count
-            count = count + counts[..., i]
-
-        var = m2 / count
-
-        var = var.reshape(1, -1, 1, 1)
-        mean = mean.reshape(1, -1, 1, 1)
-
-        return var, mean
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pragma: no cover
-
-        with amp.autocast(enabled=False):
-            dtype = x.dtype
-            x = x.float()
-
-            # start by computing std and mean
-            if self.gather_mode == "naive":
-                var, mean = self._stats_naive(x)
-            elif self.gather_mode == "welford":
-                var, mean = self._stats_welford(x)
-            else:
-                raise ValueError(f"Unknown gather mode {self.gather_mode}")
-
-            # this is absolutely necessary to get the correct graph in the backward pass
-            mean = copy_to_spatial_parallel_region(mean)
-            var = copy_to_spatial_parallel_region(var)
-
-        x = x.to(dtype)
-        mean = mean.to(dtype)
-        var = var.to(dtype)
-
-        # apply the normalization
-        x = (x - mean) / torch.sqrt(var + self.eps)
-
-        # affine transform if we use it
-        if self.affine:
-            x = self.weight * x + self.bias
-
-        return x
-
-
-
-class DistributedRealSHT(nn.Module):
-    """
-    Defines a module for computing the forward (real-valued) SHT.
-    Precomputes Legendre Gauss nodes, weights and associated Legendre polynomials on these nodes.
-    The SHT is applied to the last two dimensions of the input
-
-    [1] Schaeffer, N. Efficient spherical harmonic transforms aimed at pseudospectral numerical simulations, G3: Geochemistry, Geophysics, Geosystems.
-    [2] Wang, B., Wang, L., Xie, Z.; Accurate calculation of spherical and vector spherical harmonic expansions via spectral element grids; Adv Comput Math.
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="lobatto", norm="ortho", csphase=True):
-        """
-        Initializes the SHT Layer, precomputing the necessary quadrature weights
-
-        Parameters:
-        nlat: input grid resolution in the latitudinal direction
-        nlon: input grid resolution in the longitudinal direction
-        grid: grid in the latitude direction (for now only tensor product grids are supported)
-        """
-
-        super().__init__()
-
-        self.nlat = nlat
-        self.nlon = nlon
-        self.grid = grid
-        self.norm = norm
-        self.csphase = csphase
-
-        # TODO: include assertions regarding the dimensions
-
-        # compute quadrature points
-        if self.grid == "legendre-gauss":
-            cost, w = legendre_gauss_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        elif self.grid == "lobatto":
-            cost, w = lobatto_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat-1
-        elif self.grid == "equiangular":
-            cost, w = clenshaw_curtiss_weights(nlat, -1, 1)
-            # cost, w = fejer2_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        else:
-            raise(ValueError("Unknown quadrature mode"))
-
-        # get the comms grid:
-        self.comm_size_polar = polar_group_size()
-        self.comm_rank_polar = polar_group_rank()
-        self.comm_size_azimuth = azimuth_group_size()
-        self.comm_rank_azimuth = azimuth_group_rank()
-
-        # apply cosine transform and flip them
-        tq = np.flip(np.arccos(cost))
-
-        # determine the dimensions
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # compute splits
-        self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
-        self.lon_shapes = compute_split_shapes(self.nlon, self.comm_size_azimuth)
-        self.l_shapes = compute_split_shapes(self.lmax, self.comm_size_polar)
-        self.m_shapes = compute_split_shapes(self.mmax, self.comm_size_azimuth)
-
-        # combine quadrature weights with the legendre weights
-        weights = torch.from_numpy(w)
-        pct = _precompute_legpoly(self.mmax, self.lmax, tq, norm=self.norm, csphase=self.csphase)
-        pct = torch.from_numpy(pct)
-        weights = torch.einsum('mlk,k->mlk', pct, weights)
-
-        # split weights
-        weights = split_tensor_along_dim(weights, dim=0, num_chunks=self.comm_size_azimuth)[self.comm_rank_azimuth]
-
-        # remember quadrature weights
-        self.register_buffer('weights', weights, persistent=False)
-
-    def extra_repr(self):
-        """
-        Pretty print module
-        """
-        return f'nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}'
-
-    def forward(self, x: torch.Tensor):
-
-        # we need to ensure that we can split the channels evenly
-        num_chans = x.shape[1]
-
-        # h and w is split. First we make w local by transposing into channel dim
-        if self.comm_size_azimuth > 1:
-            x = distributed_transpose_azimuth.apply(x, (1, -1), self.lon_shapes)
-
-        # apply real fft in the longitudinal direction: make sure to truncate to nlon
-        x = 2.0 * torch.pi * torch.fft.rfft(x, n=self.nlon, dim=-1, norm="forward")
-
-        # truncate
-        x = x[..., :self.mmax]
-
-        # transpose: after this, m is split and c is local
-        if self.comm_size_azimuth > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_azimuth)
-            x = distributed_transpose_azimuth.apply(x, (-1, 1), chan_shapes)
-
-        # transpose: after this, c is split and h is local
-        if self.comm_size_polar > 1:
-            x = distributed_transpose_polar.apply(x, (1, -2), self.lat_shapes)
-
-        # do the Legendre-Gauss quadrature
-        x = torch.view_as_real(x)
-
-        # contraction
-        xs = torch.einsum('...kmr,mlk->...lmr', x, self.weights.to(x.dtype)).contiguous()
-
-        # cast to complex
-        x = torch.view_as_complex(xs)
-
-        # transpose: after this, l is split and c is local
-        if self.comm_size_polar	> 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_polar)
-            x = distributed_transpose_polar.apply(x, (-2, 1), chan_shapes)
-
-        return x
-
-
-class DistributedInverseRealSHT(nn.Module):
-    """
-    Defines a module for computing the inverse (real-valued) SHT.
-    Precomputes Legendre Gauss nodes, weights and associated Legendre polynomials on these nodes.
-    nlat, nlon: Output dimensions
-    lmax, mmax: Input dimensions (spherical coefficients). For convenience, these are inferred from the output dimensions
-
-    [1] Schaeffer, N. Efficient spherical harmonic transforms aimed at pseudospectral numerical simulations, G3: Geochemistry, Geophysics, Geosystems.
-    [2] Wang, B., Wang, L., Xie, Z.; Accurate calculation of spherical and vector spherical harmonic expansions via spectral element grids; Adv Comput Math.
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="lobatto", norm="ortho", csphase=True):
-
-        super().__init__()
-
-        self.nlat = nlat
-        self.nlon = nlon
-        self.grid = grid
-        self.norm = norm
-        self.csphase = csphase
-
-        # compute quadrature points
-        if self.grid == "legendre-gauss":
-            cost, _ = legendre_gauss_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        elif self.grid == "lobatto":
-            cost, _ = lobatto_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat-1
-        elif self.grid == "equiangular":
-            cost, _ = clenshaw_curtiss_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        else:
-            raise(ValueError("Unknown quadrature mode"))
-
-        # get the comms grid:
-        self.comm_size_polar = polar_group_size()
-        self.comm_rank_polar = polar_group_rank()
-        self.comm_size_azimuth = azimuth_group_size()
-        self.comm_rank_azimuth = azimuth_group_rank()
-
-        # apply cosine transform and flip them
-        t = np.flip(np.arccos(cost))
-
-        # determine the dimensions
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # compute splits
-        self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
-        self.lon_shapes = compute_split_shapes(self.nlon, self.comm_size_azimuth)
-        self.l_shapes = compute_split_shapes(self.lmax, self.comm_size_polar)
-        self.m_shapes = compute_split_shapes(self.mmax, self.comm_size_azimuth)
-
-        # compute legende polynomials
-        pct = _precompute_legpoly(self.mmax, self.lmax, t, norm=self.norm, inverse=True, csphase=self.csphase)
-        pct = torch.from_numpy(pct)
-
-        # split in m
-        pct = split_tensor_along_dim(pct, dim=0, num_chunks=self.comm_size_azimuth)[self.comm_rank_azimuth]
-
-        # register
-        self.register_buffer('pct', pct, persistent=False)
-
-    def extra_repr(self):
-        """
-        Pretty print module
-        """
-        return f'nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}'
-
-    def forward(self, x: torch.Tensor):
-
-        # we need to ensure that we can split the channels evenly
-        num_chans = x.shape[1]
-
-        # transpose: after that, channels are split, l is local:
-        if self.comm_size_polar > 1:
-            x = distributed_transpose_polar.apply(x, (1, -2), self.l_shapes)
-
-        # Evaluate associated Legendre functions on the output nodes
-        x = torch.view_as_real(x)
-
-        # einsum
-        xs = torch.einsum('...lmr, mlk->...kmr', x, self.pct.to(x.dtype)).contiguous()
-        #rl = torch.einsum('...lm, mlk->...km', x[..., 0], self.pct.to(x.dtype) )
-        #im = torch.einsum('...lm, mlk->...km', x[..., 1], self.pct.to(x.dtype) )
-        #xs = torch.stack((rl, im), -1).contiguous()
-
-        # inverse FFT
-        x = torch.view_as_complex(xs)
-
-        if self.comm_size_polar > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_polar)
-            x = distributed_transpose_polar.apply(x, (-2, 1), chan_shapes)
-
-        # transpose: after this, channels are split and m is local
-        if self.comm_size_azimuth > 1:
-            x = distributed_transpose_azimuth.apply(x, (1, -1), self.m_shapes)
-
-        # apply the inverse (real) FFT
-        x = torch.fft.irfft(x, n=self.nlon, dim=-1, norm="forward")
-
-        # transpose: after this, m is split and channels are local
-        if self.comm_size_azimuth > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_azimuth)
-            x = distributed_transpose_azimuth.apply(x, (-1, 1), chan_shapes)
-
-        return x
-
-
-class DistributedRealVectorSHT(nn.Module):
-    """
-    Defines a module for computing the forward (real) vector SHT.
-    Precomputes Legendre Gauss nodes, weights and associated Legendre polynomials on these nodes.
-    The SHT is applied to the last three dimensions of the input.
-
-    [1] Schaeffer, N. Efficient spherical harmonic transforms aimed at pseudospectral numerical simulations, G3: Geochemistry, Geophysics, Geosystems.
-    [2] Wang, B., Wang, L., Xie, Z.; Accurate calculation of spherical and vector spherical harmonic expansions via spectral element grids; Adv Comput Math.
-    """
-
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="lobatto", norm="ortho", csphase=True):
-        """
-        Initializes the vector SHT Layer, precomputing the necessary quadrature weights
-
-        Parameters:
-        nlat: input grid resolution in the latitudinal direction
-        nlon: input grid resolution in the longitudinal direction
-        grid: type of grid the data lives on
-        """
-
-        super().__init__()
-
-        self.nlat = nlat
-        self.nlon = nlon
-        self.grid = grid
-        self.norm = norm
-        self.csphase = csphase
-
-        # compute quadrature points
-        if self.grid == "legendre-gauss":
-            cost, w = legendre_gauss_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        elif self.grid == "lobatto":
-            cost, w = lobatto_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat-1
-        elif self.grid == "equiangular":
-            cost, w = clenshaw_curtiss_weights(nlat, -1, 1)
-            # cost, w = fejer2_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        else:
-            raise(ValueError("Unknown quadrature mode"))
-
-        # get the comms grid:
-        self.comm_size_polar = polar_group_size()
-        self.comm_rank_polar = polar_group_rank()
-        self.comm_size_azimuth = azimuth_group_size()
-        self.comm_rank_azimuth = azimuth_group_rank()
-
-        # apply cosine transform and flip them
-        tq = np.flip(np.arccos(cost))
-
-        # determine the dimensions
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # compute splits
-        self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
-        self.lon_shapes = compute_split_shapes(self.nlon, self.comm_size_azimuth)
-        self.l_shapes = compute_split_shapes(self.lmax, self.comm_size_polar)
-        self.m_shapes = compute_split_shapes(self.mmax, self.comm_size_azimuth)
-
-        # compute weights
-        weights = torch.from_numpy(w)
-        dpct = _precompute_dlegpoly(self.mmax, self.lmax, tq, norm=self.norm, csphase=self.csphase)
-        dpct = torch.from_numpy(dpct)
-
-        # combine integration weights, normalization factor in to one:
-        l = torch.arange(0, self.lmax)
-        norm_factor = 1. / l / (l+1)
-        norm_factor[0] = 1.
-        weights = torch.einsum('dmlk,k,l->dmlk', dpct, weights, norm_factor)
-        # since the second component is imaginary, we need to take complex conjugation into account
-        weights[1] = -1 * weights[1]
-
-        # we need to split in m, pad before:
-        weights = split_tensor_along_dim(weights, dim=1, num_chunks=self.comm_size_azimuth)[self.comm_rank_azimuth]
-
-        # remember quadrature weights
-        self.register_buffer('weights', weights, persistent=False)
-
-
-    def extra_repr(self):
-        """
-        Pretty print module
-        """
-        return f'nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}'
-
-    def forward(self, x: torch.Tensor):
-
-        assert(len(x.shape) >= 3)
-
-        # we need to ensure that we can split the channels evenly
-        num_chans = x.shape[1]
-
-        # h and w is split. First we make w local by transposing into channel dim
-        if self.comm_size_azimuth > 1:
-            x = distributed_transpose_azimuth.apply(x, (1, -1), self.lon_shapes)
-
-        # apply real fft in the longitudinal direction: make sure to truncate to nlon
-        x = 2.0 * torch.pi * torch.fft.rfft(x, n=self.nlon, dim=-1, norm="forward")
-
-        # truncate
-        x = x[..., :self.mmax]
-
-        # transpose: after this, m is split and c is local
-        if self.comm_size_azimuth > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_azimuth)
-            x = distributed_transpose_azimuth.apply(x, (-1, 1), chan_shapes)
-
-        # transpose: after this, c is split and h is local
-        if self.comm_size_polar > 1:
-            x = distributed_transpose_polar.apply(x, (1, -2), self.lat_shapes)
-
-        # do the Legendre-Gauss quadrature
-        x = torch.view_as_real(x)
-
-        # create output array
-        xs = torch.zeros_like(x, dtype=x.dtype, device=x.device)
-
-        # contraction - spheroidal component
-        # real component
-        xs[..., 0, :, :, 0] =   torch.einsum('...km,mlk->...lm', x[..., 0, :, :, 0], self.weights[0].to(xs.dtype)) \
-                              - torch.einsum('...km,mlk->...lm', x[..., 1, :, :, 1], self.weights[1].to(xs.dtype))
-        # imag component
-        xs[..., 0, :, :, 1] =   torch.einsum('...km,mlk->...lm', x[..., 0, :, :, 1], self.weights[0].to(xs.dtype)) \
-                              + torch.einsum('...km,mlk->...lm', x[..., 1, :, :, 0], self.weights[1].to(xs.dtype))
-
-        # contraction - toroidal component
-        # real component
-        xs[..., 1, :, :, 0] = - torch.einsum('...km,mlk->...lm', x[..., 0, :, :, 1], self.weights[1].to(xs.dtype)) \
-                              - torch.einsum('...km,mlk->...lm', x[..., 1, :, :, 0], self.weights[0].to(xs.dtype))
-        # imag component
-        xs[..., 1, :, :, 1] =   torch.einsum('...km,mlk->...lm', x[..., 0, :, :, 0], self.weights[1].to(xs.dtype)) \
-                              - torch.einsum('...km,mlk->...lm', x[..., 1, :, :, 1], self.weights[0].to(xs.dtype))
-
-        # pad if required
-        x = torch.view_as_complex(xs)
-
-        # transpose: after this, l is split and c is local
-        if self.comm_size_polar > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_polar)
-            x = distributed_transpose_polar.apply(x, (-2, 1), chan_shapes)
-
-        return x
-
-
-class DistributedInverseRealVectorSHT(nn.Module):
-    """
-    Defines a module for computing the inverse (real-valued) vector SHT.
-    Precomputes Legendre Gauss nodes, weights and associated Legendre polynomials on these nodes.
-
-    [1] Schaeffer, N. Efficient spherical harmonic transforms aimed at pseudospectral numerical simulations, G3: Geochemistry, Geophysics, Geosystems.
-    [2] Wang, B., Wang, L., Xie, Z.; Accurate calculation of spherical and vector spherical harmonic expansions via spectral element grids; Adv Comput Math.
-    """
-    def __init__(self, nlat, nlon, lmax=None, mmax=None, grid="lobatto", norm="ortho", csphase=True):
-
-        super().__init__()
-
-        self.nlat = nlat
-        self.nlon = nlon
-        self.grid = grid
-        self.norm = norm
-        self.csphase = csphase
-
-        # compute quadrature points
-        if self.grid == "legendre-gauss":
-            cost, _ = legendre_gauss_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        elif self.grid == "lobatto":
-            cost, _ = lobatto_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat-1
-        elif self.grid == "equiangular":
-            cost, _ = clenshaw_curtiss_weights(nlat, -1, 1)
-            self.lmax = lmax or self.nlat
-        else:
-            raise(ValueError("Unknown quadrature mode"))
-
-        self.comm_size_polar = polar_group_size()
-        self.comm_rank_polar = polar_group_rank()
-        self.comm_size_azimuth = azimuth_group_size()
-        self.comm_rank_azimuth = azimuth_group_rank()
-
-        # apply cosine transform and flip them
-        t = np.flip(np.arccos(cost))
-
-        # determine the dimensions
-        self.mmax = mmax or self.nlon // 2 + 1
-
-        # compute splits
-        self.lat_shapes = compute_split_shapes(self.nlat, self.comm_size_polar)
-        self.lon_shapes = compute_split_shapes(self.nlon, self.comm_size_azimuth)
-        self.l_shapes = compute_split_shapes(self.lmax, self.comm_size_polar)
-        self.m_shapes = compute_split_shapes(self.mmax, self.comm_size_azimuth)
-
-        # compute legende polynomials
-        dpct = _precompute_dlegpoly(self.mmax, self.lmax, t, norm=self.norm, inverse=True, csphase=self.csphase)
-        dpct = torch.from_numpy(dpct)
-
-        # split in m
-        dpct = split_tensor_along_dim(dpct, dim=1, num_chunks=self.comm_size_azimuth)[self.comm_rank_azimuth]
-
-        # register buffer
-        self.register_buffer('dpct', dpct, persistent=False)
-
-    def extra_repr(self):
-        """
-        Pretty print module
-        """
-        return f'nlat={self.nlat}, nlon={self.nlon},\n lmax={self.lmax}, mmax={self.mmax},\n grid={self.grid}, csphase={self.csphase}'
-
-    def forward(self, x: torch.Tensor):
-
-        # store num channels
-        num_chans = x.shape[1]
-
-        # transpose: after that, channels are split, l is local:
-        if self.comm_size_polar > 1:
-            x = distributed_transpose_polar.apply(x, (1, -2), self.l_shapes)
-
-        # Evaluate associated Legendre functions on the output nodes
-        x = torch.view_as_real(x)
-
-        # contraction - spheroidal component
-        # real component
-        srl =   torch.einsum('...lm,mlk->...km', x[..., 0, :, :, 0], self.dpct[0].to(x.dtype)) \
-              - torch.einsum('...lm,mlk->...km', x[..., 1, :, :, 1], self.dpct[1].to(x.dtype))
-        # imag component
-        sim =   torch.einsum('...lm,mlk->...km', x[..., 0, :, :, 1], self.dpct[0].to(x.dtype)) \
-              + torch.einsum('...lm,mlk->...km', x[..., 1, :, :, 0], self.dpct[1].to(x.dtype))
-
-        # contraction - toroidal component
-        # real component
-        trl = - torch.einsum('...lm,mlk->...km', x[..., 0, :, :, 1], self.dpct[1].to(x.dtype)) \
-              - torch.einsum('...lm,mlk->...km', x[..., 1, :, :, 0], self.dpct[0].to(x.dtype))
-        # imag component
-        tim =   torch.einsum('...lm,mlk->...km', x[..., 0, :, :, 0], self.dpct[1].to(x.dtype)) \
-              - torch.einsum('...lm,mlk->...km', x[..., 1, :, :, 1], self.dpct[0].to(x.dtype))
-
-        # reassemble
-        s = torch.stack((srl, sim), -1)
-        t = torch.stack((trl, tim), -1)
-        xs = torch.stack((s, t), -4)
-
-        # convert to complex
-        x = torch.view_as_complex(xs)
-
-        if self.comm_size_polar > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_polar)
-            x = distributed_transpose_polar.apply(x, (-2, 1), chan_shapes)
-
-        # transpose: after this, channels are split and m is local
-        if self.comm_size_azimuth > 1:
-            x = distributed_transpose_azimuth.apply(x, (1, -1), self.m_shapes)
-
-        # apply the inverse (real) FFT
-        x = torch.fft.irfft(x, n=self.nlon, dim=-1, norm="forward")
-
-        # transpose: after this, m is split and channels are local
-        if self.comm_size_azimuth > 1:
-            chan_shapes = compute_split_shapes(num_chans, self.comm_size_azimuth)
-            x = distributed_transpose_azimuth.apply(x, (-1, 1), chan_shapes)
-
-        return x
-
+ 
+      
 
 @dataclass
 class MetaData(ModelMetaData):
@@ -4389,43 +1578,10 @@ class SpectralFilterLayer(nn.Module):
     ):
         super(SpectralFilterLayer, self).__init__()
 
-        if filter_type == "non-linear" and (
-            isinstance(forward_transform, th.RealSHT)
-            or isinstance(forward_transform, DistributedRealSHT)
-        ):
-            self.filter = SpectralAttentionS2(
-                forward_transform,
-                inverse_transform,
-                embed_dim,
-                operator_type=operator_type,
-                sparsity_threshold=sparsity_threshold,
-                hidden_size_factor=hidden_size_factor,
-                complex_activation=complex_activation,
-                spectral_layers=spectral_layers,
-                drop_rate=drop_rate,
-                bias=False,
-            )
-
-        elif filter_type == "non-linear" and (
-            isinstance(forward_transform, RealFFT2)
-            or isinstance(forward_transform, DistributedRealFFT2)
-        ):
-            self.filter = SpectralAttention2d(
-                forward_transform,
-                inverse_transform,
-                embed_dim,
-                sparsity_threshold=sparsity_threshold,
-                hidden_size_factor=hidden_size_factor,
-                complex_activation=complex_activation,
-                spectral_layers=spectral_layers,
-                drop_rate=drop_rate,
-                bias=False,
-            )
-
         # spectral transform is passed to the module
-        elif filter_type == "linear" and (
+        if filter_type == "linear" and (
             isinstance(forward_transform, th.RealSHT)
-            or isinstance(forward_transform, DistributedRealSHT)
+            or isinstance(forward_transform, RealSHT)
         ):
             self.filter = SpectralConvS2(
                 forward_transform,
@@ -4533,7 +1689,7 @@ class FourierNeuralOperatorBlock(nn.Module):
         self.norm1 = norm_layer[1]()
 
         if use_mlp == True:
-            MLPH = DistributedMLP if (comm.get_size("matmul") > 1) else MLP
+            MLPH = MLP
             mlp_hidden_dim = int(embed_dim * mlp_ratio)
             self.mlp = MLPH(
                 in_features=embed_dim,
@@ -4596,7 +1752,7 @@ class SphericalFourierNeuralOperatorNet(Module):
         self,
         params: dict,
         spectral_transform: str = "sht",
-        filter_type: str = "non-linear",
+        filter_type: str = "linear",
         operator_type: str = "diagonal",
         img_shape: Tuple[int] = (721, 1440),
         scale_factor: int = 16,
@@ -4730,18 +1886,8 @@ class SphericalFourierNeuralOperatorNet(Module):
 
         # prepare the spectral transforms
         if self.spectral_transform == "sht":
-            sht_handle = th.RealSHT
-            isht_handle = th.InverseRealSHT
-
-            # parallelism
-            if (comm.get_size("h") > 1) or (comm.get_size("w") > 1):
-                polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
-                azimuth_group = (
-                    None if (comm.get_size("w") == 1) else comm.get_group("w")
-                )
-                thd.init(polar_group, azimuth_group)
-                sht_handle = DistributedRealSHT
-                isht_handle = DistributedInverseRealSHT
+            sht_handle = RealSHT
+            isht_handle = InverseRealSHT
 
             # set up
             self.trans_down = sht_handle(
@@ -4757,36 +1903,6 @@ class SphericalFourierNeuralOperatorNet(Module):
                 self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid="legendre-gauss"  # was legendre-gauss
             ).float()
 
-        elif self.spectral_transform == "fft":
-            fft_handle = th.RealFFT2
-            ifft_handle = th.InverseRealFFT2
-
-            # effective image size:
-            self.img_shape_eff = [
-                self.img_shape[0] + self.padding[0],
-                self.img_shape[1] + self.padding[1],
-            ]
-            self.img_shape_loc = [
-                self.img_shape_eff[0] // comm.get_size("h"),
-                self.img_shape_eff[1] // comm.get_size("w"),
-            ]
-
-            if (comm.get_size("h") > 1) or (comm.get_size("w") > 1):
-                fft_handle = DistributedRealFFT2
-                ifft_handle = DistributedInverseRealFFT2
-
-            self.trans_down = fft_handle(
-                *self.img_shape_eff, lmax=modes_lat, mmax=modes_lon
-            ).float()
-            self.itrans_up = ifft_handle(
-                *self.img_shape_eff, lmax=modes_lat, mmax=modes_lon
-            ).float()
-            self.trans = fft_handle(
-                self.h, self.w, lmax=modes_lat, mmax=modes_lon
-            ).float()
-            self.itrans = ifft_handle(
-                self.h, self.w, lmax=modes_lat, mmax=modes_lon
-            ).float()
         else:
             raise (ValueError("Unknown spectral transform"))
 
@@ -4846,21 +1962,13 @@ class SphericalFourierNeuralOperatorNet(Module):
                 nn.LayerNorm, normalized_shape=(self.h_loc, self.w_loc), eps=1e-6
             )
         elif self.normalization_layer == "instance_norm":
-            if comm.get_size("spatial") > 1:
-                norm_layer0 = partial(
-                    DistributedInstanceNorm2d,
-                    num_features=self.embed_dim,
-                    eps=1e-6,
-                    affine=True,
-                )
-            else:
-                norm_layer0 = partial(
-                    nn.InstanceNorm2d,
-                    num_features=self.embed_dim,
-                    eps=1e-6,
-                    affine=True,
-                    track_running_stats=False,
-                )
+            norm_layer0 = partial(
+                nn.InstanceNorm2d,
+                num_features=self.embed_dim,
+                eps=1e-6,
+                affine=True,
+                track_running_stats=False,
+            )
             norm_layer1 = norm_layer0
         elif self.normalization_layer == "none":
             norm_layer0 = nn.Identity
@@ -5073,13 +2181,14 @@ class RealSHT(nn.Module):
         self.mmax = mmax or self.nlon // 2 + 1
 
         # combine quadrature weights with the legendre weights
-        weights = torch.from_numpy(w)
-        pct = precompute_legpoly(self.mmax, self.lmax, tq, norm=self.norm, csphase=self.csphase)
+        weights = torch.from_numpy(w).to(device)
+        pct = _precompute_legpoly(self.mmax, self.lmax, tq, norm=self.norm, csphase=self.csphase)
+        pct = torch.from_numpy(pct).to(device)
         weights = torch.einsum('mlk,k->mlk', pct, weights)
 
         # remember quadrature weights
         # if USE_FIX:
-        self.weights = weights.float()
+        self.weights = weights.float().to(device)
         # else:
         #     self.register_buffer('weights', weights, persistent=False)
 
@@ -5105,10 +2214,8 @@ class RealSHT(nn.Module):
         out_shape[-3] = self.lmax
         out_shape[-2] = self.mmax
         xout = torch.zeros(out_shape, dtype=x.dtype, device=x.device)
-
         # contraction
-        if USE_FIX:
-            self.weights = self.weights.to(x.device)
+        self.weights = self.weights.to(x.device)
         xout[..., 0] = torch.einsum('...km,mlk->...lm', x[..., :self.mmax, 0], self.weights)
         xout[..., 1] = torch.einsum('...km,mlk->...lm', x[..., :self.mmax, 1], self.weights)
         x = torch.view_as_complex(xout)
@@ -5210,7 +2317,7 @@ class SpectralLoss(nn.Module):
         self.absolute = absolute
         self.squared = squared
 
-        self.sht = th.RealSHT(*img_size, grid="legendre-gauss").float()
+        self.sht = RealSHT(*img_size, grid="legendre-gauss").float()
         spectral_weights = torch.arange(self.sht.lmax).float()
         spectral_weights = spectral_weights + 1
         self.register_buffer("spectral_weights", spectral_weights)
@@ -5290,8 +2397,192 @@ class SpectralLoss(nn.Module):
         return loss
 
 
+def integrate_grid(ugrid, dimensionless=False, polar_opt=0):
+
+    dlon = 2 * torch.pi / nlon
+    radius = 1 if dimensionless else radius
+    if polar_opt > 0:
+        out = torch.sum(ugrid[..., polar_opt:-polar_opt, :] * quad_weights[polar_opt:-polar_opt] * dlon * radius**2, dim=(-2, -1))
+    else:
+        out = torch.sum(ugrid * quad_weights * dlon * radius**2, dim=(-2, -1))
+    return out
+
+def l2loss_sphere(prd, tar, relative=False, squared=True):
+    loss = integrate_grid((prd - tar)**2, dimensionless=True).sum(dim=-1)
+    if relative:
+        loss = loss / integrate_grid(tar**2, dimensionless=True).sum(dim=-1)
+
+    if not squared:
+        loss = torch.sqrt(loss)
+    loss = loss.mean()
+
+    return loss
+
+def spectral_l2loss_sphere(prd, tar, relative=False, squared=True):
+    # compute coefficients
+    prd = prd.cpu()
+    tar = tar.cpu()
+    diff = (prd-tar)
+
+    shtdiff = sht(diff)
+    coeffs = torch.view_as_real(shtdiff)
+    coeffs = coeffs[..., 0]**2 + coeffs[..., 1]**2
+    norm2 = coeffs[..., :, 0] + 2 * torch.sum(coeffs[..., :, 1:], dim=-1)
+    loss = torch.sum(norm2, dim=(-1,-2))
+
+    if relative:
+        tar_coeffs = torch.view_as_real(sht(tar))
+        tar_coeffs = tar_coeffs[..., 0]**2 + tar_coeffs[..., 1]**2
+        tar_norm2 = tar_coeffs[..., :, 0] + 2 * torch.sum(tar_coeffs[..., :, 1:], dim=-1)
+        tar_norm2 = torch.sum(tar_norm2, dim=(-1,-2))
+        loss = loss / tar_norm2
+
+    if not squared:
+        loss = torch.sqrt(loss)
+    loss = loss.mean()
+
+    return loss
 
 
 
+import time
+
+def spectral_regularizer(prd, tar, relative=False, squared=True):
+    # compute coefficients
+    diff = (prd-tar)
+
+    shtdiff = sht(diff)
+    coeffs = torch.view_as_real(shtdiff)
+
+    coeffs = coeffs[..., 0]**2 + coeffs[..., 1]**2    # take the real part only
+
+    norm2 = 2 * torch.sum(coeffs[..., :, 24:], dim=-1)  # regularize the wave number beyond 5
+    loss_reg = torch.sum(norm2, dim=(-1,-2))
+
+    if not squared:
+        loss_reg = torch.sqrt(loss_reg)
+    loss_reg = loss_reg.mean()
+
+    return loss_reg
+
+num_elements = 48
+
+# Generate evenly spaced values between -π/2 and π/2
+cos_weight_reg = torch.cos(torch.linspace(-np.pi, np.pi, num_elements)).to(device).reshape(1,48) + 1
+
+
+mse_loss = nn.MSELoss()
+def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, loss_fn='l2', reg_rate=0):
+
+    train_start = time.time()
+
+    train_loader_1 = DataLoader(train_set, batch_size=16, shuffle=True)
+    test_loader_1 = DataLoader(test_set, batch_size=16, shuffle=True)
+
+    infer_bias = 1e+20
+    recall_count = 0
+    for epoch in range(nepochs):
+        print(epoch)
+        if epoch >= 200:
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 1e-6
+        if recall_count > 20:
+            break
+        epoch_start = time.time()
+
+        optimizer.zero_grad()
+        acc_loss = 0
+
+        model.train()
+        batch_num = 0
+        for inp, tar in train_loader_1:
+            #noise = (torch.randn(inp.size(0), 5, inp.size(2), inp.size(3)) * std + mean).to(device)
+            batch_num += 1
+            loss = 0
+            inp = inp.to(device)
+            #inp[:,:5,:,:] += noise
+            tar = tar.to(device)
+            #tar[:,:5,:,:] -= noise
+            prd = model(inp)
+
+            if loss_fn == 'l2':
+                loss_delta = l2loss_sphere(prd[:,:5,:,:], tar[:,:5,:,:], relative=True)
+                loss_tp = torch.mean((prd[:,5:,:,:]-tar[:,5:,:,:])**2)
+                loss = (loss_delta.to(device)*5 + loss_tp.to(device))/6
+            elif loss_fn == "spectral l2":
+                loss = SpectralLoss(img_size=(48, 96), absolute=True)(prd.to("cpu"),tar.to("cpu"))
+
+            lat_index = np.r_[7:15, 32:40]
+            #lat_index = np.r_[0:48]
+            out_fft = torch.mean(torch.abs(torch.fft.rfft(prd[:,:,lat_index,:],dim=3)),dim=2)
+            target_fft = torch.mean(torch.abs(torch.fft.rfft(tar[:,:,lat_index,:],dim=3)),dim=2)
+
+            quad_weight_reg = quad_weights.reshape(1,48)
+
+            wave_index = np.r_[0:48]
+            #wave_index = np.r_[7:15,32:40]
+            loss_fft = torch.abs(out_fft[...,wave_index] - target_fft[...,wave_index])
+            loss_reg = torch.mean(loss_fft,dim)
+            
+            loss.backward()
+            optimizer.step()
+            prd_plt = prd
+            tar_plt = tar
+            
+        with torch.no_grad():
+            for inp, tar in test_loader_1:
+                inp = inp.to(device)
+                tar = tar.to(device)
+                prd = model(inp)
+                if loss_fn == 'l2':
+                    loss = l2loss_sphere(prd, tar, relative=True).mean()
+                elif loss_fn == "spectral l2":
+                    loss = spectral_l2loss_sphere(prd, tar, relative=True)
+                prd = prd.to(device)
+
+                valid_loss += loss.item() * inp.size(0)
+                prd_testplt = prd
+                tar_testplt = tar
+        valid_loss = valid_loss / len(test_loader_1.dataset)
+        epoch_time = time.time() - epoch_start
+
+        if scheduler is not None:
+            scheduler.step()
+
+        if (epoch+1) % 5 == 0:
+            print(loss, valid_loss)
+            with torch.no_grad():
+                pred_frame = input_dataset[0].reshape(1,7,48,96) # T, SH, U, V, SP, TISR, ORO
+                pred_frame = pred_frame.to(device)
+                temp_bias = torch.zeros(48,96).to(device)
+                for k in range(7500):
+                    previous_frame = pred_frame[:,:5,:,:]
+                    pred_frame = model(pred_frame) # 6
+                    temp_bias += pred_frame[0,1,:,:].clone().detach()
+                    pred_frame[:,:5,:,:] = pred_frame[:,:5,:,:] * target_stds[:,:5,:,:] # T, SH, U, V, SP, TP
+                    # pred_frame = (pred_frame + 1) / 2 * (target_maxs - target_mins) + target_mins
+
+                    pred_frame[:,:5,:,:] += previous_frame[:,:5,:,:] * input_stds + input_means
+                    tp_frame = pred_frame[:,5:,:,:] * tp_std + tp_mean
+                    # pred_frame += (previous_frame + 1) / 2 * (input_maxs - input_mins) + input_mins
+                    plot_frame = torch.cat((pred_frame[:,:5,:,:], tp_frame), 1) # T, SH, U, V, SP, TP
+
+                    pred_frame = pred_frame[:,:5,:,:]
+                    pred_frame = (pred_frame - input_means) / input_stds
+                    # pred_frame = 2 * (pred_frame - input_mins) / (input_maxs - input_mins) - 1
+
+                    pred_frame = torch.cat((pred_frame, input_dataset[k+1,5:,:,:].reshape(1,2,48,96).to(device)), dim=1)
+                    
+                temp_bias = torch.mean(torch.abs(temp_bias / 7500 - true_temp_clim))
+                print(infer_bias)
+                if epoch > 100:
+                    print(infer_bias)
+                    if temp_bias <= infer_bias:
+                        infer_bias = temp_bias
+                        torch.save(model.state_dict(), 'regular_training_checkpoint.pth')
+                    else:
+                        state_pth = torch.load('regular_training_checkpoint.pth')
+                        model.load_state_dict(state_pth)
+                        recall_count += 1
 
 
