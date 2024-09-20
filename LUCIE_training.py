@@ -14,24 +14,17 @@ import time
 
 
 from torch_harmonics import *
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
-from torch.utils.checkpoint import checkpoint
 from torch.cuda import amp
 import math
 from math import ceil, sqrt
 import warnings
 
-from torch.cuda import amp
-
 # import FactorizedTensor from tensorly for tensorized operations
 import tensorly as tl
 
 tl.set_backend("pytorch")
-# from tensorly.plugins import use_opt_einsum
-# use_opt_einsum('optimal')
 from tltorch.factorized_tensors.core import FactorizedTensor
 
 import os
@@ -53,6 +46,8 @@ from dataclasses import dataclass
 
 from torch.utils.data import Dataset, TensorDataset, DataLoader
 from typing import Optional, Tuple
+
+from SFNO import *
 
 def geometric_mean(array):
     log_array = np.log(array)
@@ -115,7 +110,7 @@ test_loader = DataLoader(test_set, batch_size=1, shuffle=False)
 
 
 
-def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, loss_fn='l2', reg_rate=0):
+def train_model_fine(model, train_set, test_set, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, loss_fn='l2', reg_rate=0):
 
     train_start = time.time()
 
@@ -124,19 +119,13 @@ def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=2
 
     infer_bias = 1e+20
     recall_count = 0
-    for epoch in range(nepochs):
-        print(epoch)
-        for param_group in optimizer.param_groups:
-            print(param_group['lr'])
+    for epoch in tqdm(range(nepochs)):
         if epoch < 149:
             if scheduler is not None:
                 scheduler.step()
         else:
             for param_group in optimizer.param_groups:
                 param_group['lr'] = 1e-6
-        if recall_count > 10:
-            print(epoch)
-            break
         epoch_start = time.time()
 
         optimizer.zero_grad()
@@ -145,45 +134,41 @@ def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=2
         model.train()
         batch_num = 0
         for inp, tar in train_loader_1:
-            #noise = (torch.randn(inp.size(0), 5, inp.size(2), inp.size(3)) * std + mean).to(device)
             batch_num += 1
             loss = 0
             inp = inp.to(device)
-            #inp[:,:5,:,:] += noise
             tar = tar.to(device)
-            #tar[:,:5,:,:] -= noise
             prd = model(inp)
 
             if loss_fn == 'l2':
                 loss_delta = l2loss_sphere(prd[:,:5,:,:], tar[:,:5,:,:], relative=True)
+                #loss_tp = SpectralLoss(img_size=(48, 96), absolute=True)(prd[:,5:,:,:].to("cpu"),tar[:,5:,:,:].to("cpu"))
                 loss_tp = torch.mean((prd[:,5:,:,:]-tar[:,5:,:,:])**2)
                 loss = (loss_delta.to(device)*5 + loss_tp.to(device))/6
-
             elif loss_fn == "spectral l2":
-
                 loss = SpectralLoss(img_size=(48, 96), absolute=True)(prd.to("cpu"),tar.to("cpu"))
 
 
             prd = prd.to(device)
             roll_loss = 0
             acc_loss += loss.item() * inp.size(0)
-            # optimizer.zero_grad()
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             prd_plt = prd
             tar_plt = tar
 
+        if scheduler is not None:
+            scheduler.step()
 
-        if (epoch+1) % 5 == 0:
-            model.eval()
+        if (epoch+1) % 10 == 0:
             with torch.no_grad():
                 pred_frame = input_dataset[0].reshape(1,7,48,96) # T, SH, U, V, SP, TISR, ORO
                 pred_frame = pred_frame.to(device)
                 temp_bias = torch.zeros(48,96).to(device)
-                for k in range(7500):
+                for k in range(2920):
                     previous_frame = pred_frame[:,:5,:,:]
                     pred_frame = model(pred_frame) # 6
-                    temp_bias += pred_frame[0,0,:,:].clone().detach()
                     pred_frame[:,:5,:,:] = pred_frame[:,:5,:,:] * target_stds[:,:5,:,:] # T, SH, U, V, SP, TP
                     # pred_frame = (pred_frame + 1) / 2 * (target_maxs - target_mins) + target_mins
 
@@ -194,21 +179,28 @@ def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=2
 
                     pred_frame = pred_frame[:,:5,:,:]
                     pred_frame = (pred_frame - input_means) / input_stds
+                    if k >= 1460:
+                        temp_bias += pred_frame[0,0,:,:].clone().detach()
                     # pred_frame = 2 * (pred_frame - input_mins) / (input_maxs - input_mins) - 1
 
                     pred_frame = torch.cat((pred_frame, input_dataset[k+1,5:,:,:].reshape(1,2,48,96).to(device)), dim=1)
                     
-                temp_bias = torch.mean(torch.abs(temp_bias / 7500 - true_temp_clim))
+                temp_bias = torch.mean(torch.abs(temp_bias / 1460 - true_temp_clim))
                 print(temp_bias)
-                if epoch > 100:
+                validation_bias.append(temp_bias)
+                if epoch > 1:
                     if temp_bias <= infer_bias:
                         infer_bias = temp_bias
-                        torch.save(model.state_dict(), 'LUCIE_method_results/LUCIE_training_checkpoint.pth')
+                        torch.save(model.state_dict(), 'LUCIE_method_results/regular_training_checkpoint.pth')
                         recall_count = 0
                     else:
-                        state_pth = torch.load('LUCIE_method_results/LUCIE_training_checkpoint.pth')
+                        print('recall')
+                        state_pth = torch.load('LUCIE_method_results/regular_training_checkpoint.pth')
                         model.load_state_dict(state_pth)
                         recall_count += 1
+                        if recall_count > 3:
+                            print(epoch)
+                            break
                         
                     
                 plot_frame = plot_frame.clone().detach().cpu().numpy()
@@ -238,7 +230,6 @@ def train_model(model, train_set, test_set, optimizer, scheduler=None, nepochs=2
                 plt.axis("off")
                 plt.colorbar(shrink=0.3)
                 plt.show()
-
 
 
 

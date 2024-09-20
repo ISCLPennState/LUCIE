@@ -11,14 +11,11 @@ from torch.nn.parallel import DistributedDataParallel
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 import time
-
+import gc
 
 from torch_harmonics import *
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.fft
-from torch.utils.checkpoint import checkpoint
 from torch.cuda import amp
 import math
 from math import ceil, sqrt
@@ -47,10 +44,11 @@ from torch_harmonics.distributed import polar_group_size, azimuth_group_size, di
 from torch_harmonics.distributed import polar_group_rank, azimuth_group_rank
 from torch_harmonics.distributed import compute_split_shapes, split_tensor_along_dim
 
-from LUCIE_utils import *
+from utils import *
+from SFNO import *
+from data_loader import *
 
 from dataclasses import dataclass
-
 
 from torch.utils.data import Dataset, TensorDataset, DataLoader
 from typing import Optional, Tuple
