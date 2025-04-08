@@ -55,7 +55,7 @@ def l2loss_sphere(prd, tar, relative=False, squared=True):
     return loss
 
 
-def train_model(model, train_loader, val_loader, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, loss_fn='l2', reg_rate=0):
+def train_model(model, train_loader, val_loader, optimizer, scheduler=None, nepochs=20, nfuture=0, num_examples=256, num_valid=8, reg_rate=0):
 
 
     infer_bias = 1e+80
@@ -80,11 +80,10 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler=None, nepo
             tar = tar.to(device)
             prd = model(inp)
 
-            if loss_fn == 'l2':
-                loss_delta = l2loss_sphere(prd[:,:5,:,:], tar[:,:5,:,:], relative=True)
-                loss_tp = torch.mean((prd[:,5:,:,:]-tar[:,5:,:,:])**2)
-                loss = loss_delta + loss_tp / tar.shape[1]
 
+            loss_delta = l2loss_sphere(prd[:,:5,:,:], tar[:,:5,:,:], relative=True)
+            loss_tp = torch.mean((prd[:,5:,:,:]-tar[:,5:,:,:])**2)
+            loss = loss_delta + loss_tp / tar.shape[1]
 
             lat_index = np.r_[7:15, 32:40]
             # lat_index = np.r_[0:48]
@@ -99,16 +98,13 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler=None, nepo
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step()
-
-        if (epoch+1) % 1 == 0:
+            
+        if epoch % 10 == 0:
             rollout_steps = 2920
             rollout = torch.tensor(inference(model, rollout_steps, data_inp[0:1].to(device), data_inp[:1460,-2:].to(device), 1, prog_means, prog_stds, diag_means, diag_stds, diff_stds)).to(device)
             rollout_clim = torch.mean(rollout[1460:],dim=0)
             clim_bias = torch.mean(torch.abs(rollout_clim - true_clim))
-
+            print("2 year rollout bias", clim_bias)
             if epoch > 60:
                 if clim_bias <= infer_bias:
                     infer_bias = clim_bias
@@ -122,53 +118,52 @@ def train_model(model, train_loader, val_loader, optimizer, scheduler=None, nepo
                         break
 
 
-if __name__ == "__main__":
+data = load_data("era5_T30_regridded.npz")[...,:6]
+true_clim = torch.tensor(np.mean(data, axis=0)).to(device).permute(2,0,1)
 
-    data = load_data("era5_T30_regridded.npz")[...,:6]
-    true_clim = torch.tensor(np.mean(data, axis=0)).to(device).permute(2,0,1)
+data = np.load("era5_T30_preprocessed.npz")     # standardized data with mean and stds generated from dataset_generator.py
+data_inp = torch.tensor(data["data_inp"],dtype=torch.float32)     # input data 
+data_tar = torch.tensor(data["data_tar"],dtype=torch.float32)
+raw_means = torch.tensor(data["raw_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
+raw_stds = torch.tensor(data["raw_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
+prog_means = raw_means[:,:5]
+prog_stds = raw_stds[:,:5]
+diag_means = torch.tensor(data["diag_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
+diag_stds = torch.tensor(data["diag_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
+diff_means = torch.tensor(data["diff_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
+diff_stds = torch.tensor(data["diff_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
 
-    data = np.load("era5_T30_preprocessed.npz")     # standardized data with mean and stds generated from dataset_generator.py
-    data_inp = torch.tensor(data["data_inp"],dtype=torch.float32)     # input data 
-    data_tar = torch.tensor(data["data_tar"],dtype=torch.float32)
-    raw_means = torch.tensor(data["raw_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
-    raw_stds = torch.tensor(data["raw_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
-    prog_means = raw_means[:,:5]
-    prog_stds = raw_means[:,:5]
-    diag_means = torch.tensor(data["diag_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
-    diag_stds = torch.tensor(data["diag_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
-    diff_means = torch.tensor(data["diff_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
-    diff_stds = torch.tensor(data["diff_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
+ntrain = 16000
+nval = 100
 
-    ntrain = 16000
-    nval = 100
+train_set = TensorDataset(data_inp[:ntrain],data_tar[:ntrain])
+val_set = TensorDataset(data_inp[ntrain:ntrain+nval],data_tar[ntrain:ntrain+nval])
 
-    train_set = TensorDataset(data_inp[:ntrain],data_tar[:ntrain])
-    val_set = TensorDataset(data_inp[ntrain:ntrain+nval],data_tar[ntrain:ntrain+nval])
-
-    train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=4, shuffle=False)
+train_loader = DataLoader(train_set, batch_size=16, shuffle=True)
+val_loader = DataLoader(val_set, batch_size=4, shuffle=False)
 
 
-    grid='legendre-gauss'
-    nlat = 48
-    nlon = 96
-    hard_thresholding_fraction = 0.9
-    lmax = ceil(nlat / 1)
-    mmax = lmax
-    modes_lat = int(nlat * hard_thresholding_fraction)
-    modes_lon = int(nlon//2 * hard_thresholding_fraction)
-    modes_lat = modes_lon = min(modes_lat, modes_lon)
-    sht = RealSHT(nlat, nlon, lmax=modes_lat, mmax=modes_lon, grid=grid, csphase=False)
-    radius=6.37122E6
-    cost, quad_weights = legendre_gauss_weights(nlat, -1, 1)
-    quad_weights = (torch.as_tensor(quad_weights).reshape(-1, 1)).to(device)
 
-    model = SphericalFourierNeuralOperatorNet(params = {}, spectral_transform='sht', filter_type = "linear", operator_type='dhconv', img_shape=(48, 96),
-                    num_layers=8, in_chans=7, out_chans=6, scale_factor=1, embed_dim=72, activation_function="silu", big_skip=True, pos_embed="latlon", use_mlp=True,
-                                            normalization_layer="instance_norm", hard_thresholding_fraction=hard_thresholding_fraction,
-                                            mlp_ratio = 2.).to(device)
+grid='legendre-gauss'
+nlat = 48
+nlon = 96
+hard_thresholding_fraction = 0.9
+lmax = ceil(nlat / 1)
+mmax = lmax
+modes_lat = int(nlat * hard_thresholding_fraction)
+modes_lon = int(nlon//2 * hard_thresholding_fraction)
+modes_lat = modes_lon = min(modes_lat, modes_lon)
+sht = RealSHT(nlat, nlon, lmax=modes_lat, mmax=modes_lon, grid=grid, csphase=False)
+radius=6.37122E6
+cost, quad_weights = legendre_gauss_weights(nlat, -1, 1)
+quad_weights = (torch.as_tensor(quad_weights).reshape(-1, 1)).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
-    scheduler = CosineAnnealingLR(optimizer, T_max=150, eta_min=1e-5)
-    train_model(model, train_loader, val_loader, optimizer, scheduler=scheduler, nepochs=500, loss_fn = "l2")
-    # torch.save(model.state_dict(), 'model.pth')
+model = SphericalFourierNeuralOperatorNet(params = {}, spectral_transform='sht', filter_type = "linear", operator_type='dhconv', img_shape=(48, 96),
+                num_layers=8, in_chans=7, out_chans=6, scale_factor=1, embed_dim=72, activation_function="silu", big_skip=True, pos_embed="latlon", use_mlp=True,
+                                        normalization_layer="instance_norm", hard_thresholding_fraction=hard_thresholding_fraction,
+                                        mlp_ratio = 2.).to(device)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
+scheduler = CosineAnnealingLR(optimizer, T_max=150, eta_min=1e-5)
+train_model(model, train_loader, val_loader, optimizer, scheduler=scheduler, nepochs=500)
+torch.save(model.state_dict(), 'model.pth')

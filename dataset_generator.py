@@ -19,10 +19,7 @@ def normalize(data, diff=False):
 
 
 
-data = np.load("zenodo_ready/era5_T30_regridded.npz")
-print(list(data.keys()))
-print(data['orography'].shape)
-print(len(data.keys()))
+data = np.load("era5_T30_regridded.npz")
 
 vars = ['temperature', 'humidity', 'u_wind', 'v_wind', 'surface_pressure', 'precipitation', 'tisr', 'orography']
 raw_vars = ['temperature', 'humidity', 'u_wind', 'v_wind', 'surface_pressure', 'tisr', 'orography']
@@ -47,8 +44,8 @@ for idx, var in tqdm(enumerate(raw_vars)):
         data_tar[:,idx,:,:], diff_means[idx], diff_stds[idx] = normalize(data[var][1:]-data[var][:-1], diff=True)
 
 for idx, var in tqdm(enumerate(diag_vars)):
-    data_tar[:,-1,:,:], diag_means[idx], diag_means[idx] = normalize(data[var][1:], diff=False)
+    data_tar[:,-1,:,:], diag_means[idx], diag_stds[idx] = normalize(np.log(data[var][1:]/1e-2+1), diff=False)
 
 
-np.savez("zenodo_ready/era5_T30_preprocessed.npz", data_inp=data_inp, data_tar=data_tar, raw_means=raw_means, raw_stds=raw_stds, diag_means=diag_means, diag_stds=diag_stds, diff_means=diff_means, diff_stds=diff_stds)
+np.savez("era5_T30_preprocessed.npz", data_inp=data_inp, data_tar=data_tar, raw_means=raw_means, raw_stds=raw_stds, diag_means=diag_means, diag_stds=diag_stds, diff_means=diff_means, diff_stds=diff_stds)
 

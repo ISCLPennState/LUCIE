@@ -35,24 +35,25 @@ def inference(model, steps, initial_frame, forcing, initial_forcing_idx, prog_me
     with torch.no_grad():
         inp_val = initial_frame
         for i in tqdm(range(steps)):
-            forcing_idx = (initial_forcing_idx + i) % 1460
+            forcing_idx = (initial_forcing_idx + i) % 1460      # tisr is repeating and orography is 
             previous = inp_val[:,:5,:,:]
 
             pred = model(inp_val)
-            pred[:,:5,:,:] = pred[:,:5,:,:] * diff_stds
+            pred[:,:5,:,:] = pred[:,:5,:,:] * diff_stds         # denormalize the predicted tendency
 
-            pred[:,:5,:,:] += previous[:,:5,:,:] * prog_stds + prog_means
+            # demornalzie the previous time step and add to the tendecy to reconstruct the current field
+            pred[:,:5,:,:] += previous[:,:5,:,:] * prog_stds + prog_means   
             tp_frame = pred[:,5:,:,:] * diag_stds + diag_means
             # pred_frame += (previous_frame + 1) / 2 * (input_maxs - input_mins) + input_mins
             raw = torch.cat((pred[:,:5,:,:],tp_frame), 1)
 
-            inp_val = (raw[:,:5,:,:] - prog_means) / prog_stds
+            inp_val = (raw[:,:5,:,:] - prog_means) / prog_stds      # normalize the current time step for autoregressive prediction
             inp_val = torch.cat((inp_val, forcing[forcing_idx,:,:,:].reshape(1,2,48,96)), dim=1)
             raw = raw.cpu().clone().detach().numpy()
             inf_data.append(raw[0])
 
     inf_data = np.array(inf_data)
-    inf_data[:,5,:,:] = (np.exp(inf_data[:,5,:,:]) - 1) * 1e-2
+    inf_data[:,5,:,:] = (np.exp(inf_data[:,5,:,:]) - 1) * 1e-2      # denormalzie precipitation that was normalized in log space
     return inf_data
 
 
@@ -67,7 +68,7 @@ if __name__ == "__main__":
     raw_means = torch.tensor(data["raw_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
     raw_stds = torch.tensor(data["raw_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
     prog_means = raw_means[:,:5]
-    prog_stds = raw_means[:,:5]
+    prog_stds = raw_stds[:,:5]
     diag_means = torch.tensor(data["diag_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
     diag_stds = torch.tensor(data["diag_stds"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
     diff_means = torch.tensor(data["diff_means"],dtype=torch.float32).reshape(1,-1,1,1).to(device)
