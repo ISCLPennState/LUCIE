@@ -17,7 +17,7 @@ This repository prvides the following:
 1. A local torch-harmonics (https://github.com/NVIDIA/torch-harmonics) utility file to avoid packaging issue.
 2. A pretrained LUCIE checkpoint that is used for the paper.
 3. A inference file to replicate the autoregressive inference used for the results in the paper.
-4. A training file.
+4. A training file that trains the model from scratch.
 5. The data generator file that precprocesses the regridded ERA5 data.
 
 ## Note
