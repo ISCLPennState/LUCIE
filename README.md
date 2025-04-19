@@ -6,7 +6,7 @@
 ## Paper & Data
 
 - [arXiv Preprint: arxiv.org/abs/2405.16297](https://arxiv.org/abs/2405.16297)
-- [Zenodo Archive](https://zenodo.org/records/15164648)
+- [Zenodo Archive: zenodo.org/records/15164648](https://zenodo.org/records/15164648)
 
 ---
 
